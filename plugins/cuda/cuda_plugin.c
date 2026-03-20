@@ -13,8 +13,13 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 
 /* cuda-checkpoint binary should live in your PATH */
@@ -58,6 +63,387 @@ struct pid_info {
  * release them after we're done with the DUMP
  */
 static LIST_HEAD(cuda_pids);
+
+/* ---- Fast GPU page I/O ----
+ *
+ * After cuda-checkpoint --action checkpoint, VRAM data is moved into new
+ * anonymous private mappings in the target process. These pages would normally
+ * go through CRIU's slow ptrace page walk. Instead we:
+ *
+ *   Dump: scan VMAs before/after checkpoint, find new ones, dump them with
+ *         process_vm_readv, then free them via process_madvise(MADV_DONTNEED)
+ *         so CRIU sees empty pages and skips them.
+ *
+ *   Restore: before cuda-checkpoint restore, write the pages back with
+ *            process_vm_writev. Then cuda-checkpoint restore reads them from
+ *            the process and copies back to VRAM.
+ */
+
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+
+#ifndef SYS_process_madvise
+#define SYS_process_madvise 440
+#endif
+
+#ifndef SYS_process_vm_readv
+#define SYS_process_vm_readv 310
+#endif
+
+#ifndef SYS_process_vm_writev
+#define SYS_process_vm_writev 311
+#endif
+
+#define GPU_PAGES_MAGIC	  0x47505544u /* "GPUD" */
+#define GPU_IO_CHUNK_SIZE (64 * 1024 * 1024)
+
+struct gpu_region {
+	uint64_t start;
+	uint64_t size;
+};
+
+struct gpu_pages_hdr {
+	uint32_t magic;
+	uint32_t num_regions;
+};
+
+/*
+ * Scan /proc/<pid>/maps for anonymous private rw- VMAs.
+ * Anonymous = dev 0:0, ino 0, no filename.
+ */
+static int scan_anon_private_vmas(int pid, struct gpu_region **out, int *count)
+{
+	char maps_path[64];
+	FILE *f;
+	char line[256];
+	struct gpu_region *regions = NULL;
+	int n = 0, cap = 0;
+
+	snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+	f = fopen(maps_path, "r");
+	if (!f) {
+		pr_perror("Cannot open %s", maps_path);
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long start, end, offset, ino;
+		unsigned int dev_maj, dev_min;
+		char perms[8];
+		char name[128];
+		int n_parsed;
+		struct gpu_region *tmp;
+		int new_cap;
+
+		name[0] = '\0';
+		n_parsed = sscanf(line, "%lx-%lx %7s %lx %x:%x %lu %127s",
+				  &start, &end, perms, &offset,
+				  &dev_maj, &dev_min, &ino, name);
+		if (n_parsed < 7)
+			continue;
+
+		/* anonymous: dev=0:0, ino=0, no filename */
+		if (dev_maj != 0 || dev_min != 0 || ino != 0)
+			continue;
+		if (n_parsed >= 8 && name[0] != '\0')
+			continue;
+
+		/* private, read-write */
+		if (perms[3] != 'p' || perms[0] != 'r' || perms[1] != 'w')
+			continue;
+
+		if (n >= cap) {
+			new_cap = cap ? cap * 2 : 64;
+			tmp = realloc(regions, (size_t)new_cap * sizeof(*regions));
+			if (!tmp) {
+				pr_err("OOM in scan_anon_private_vmas\n");
+				fclose(f);
+				free(regions);
+				return -1;
+			}
+			regions = tmp;
+			cap = new_cap;
+		}
+
+		regions[n].start = (uint64_t)start;
+		regions[n].size = (uint64_t)(end - start);
+		n++;
+	}
+
+	fclose(f);
+	*out = regions;
+	*count = n;
+	return 0;
+}
+
+/*
+ * Find VMAs present in 'after' but not in 'before'.
+ * These are the new anonymous mappings created by cuda-checkpoint for VRAM.
+ */
+static int diff_anon_vmas(struct gpu_region *before, int n_before, struct gpu_region *after, int n_after,
+			  struct gpu_region **diff_out, int *diff_count)
+{
+	struct gpu_region *diff = NULL;
+	int n = 0, cap = 0;
+	int i, j;
+
+	for (i = 0; i < n_after; i++) {
+		bool found = false;
+
+		for (j = 0; j < n_before; j++) {
+			if (before[j].start == after[i].start && before[j].size == after[i].size) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			struct gpu_region *tmp;
+			int new_cap;
+
+			if (n >= cap) {
+				new_cap = cap ? cap * 2 : 16;
+				tmp = realloc(diff, (size_t)new_cap * sizeof(*diff));
+				if (!tmp) {
+					pr_err("OOM in diff_anon_vmas\n");
+					free(diff);
+					return -1;
+				}
+				diff = tmp;
+				cap = new_cap;
+			}
+			diff[n++] = after[i];
+		}
+	}
+
+	*diff_out = diff;
+	*diff_count = n;
+	return 0;
+}
+
+/*
+ * Dump GPU memory regions to gpu-pages-<pid>.img in the CRIU image dir.
+ * File format: gpu_pages_hdr | gpu_region[num_regions] | raw page data
+ */
+static int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int count)
+{
+	char fname[64];
+	int fd, ret = -1, i;
+	struct gpu_pages_hdr hdr;
+	char *buf = NULL;
+
+	hdr.magic = GPU_PAGES_MAGIC;
+	hdr.num_regions = (uint32_t)count;
+
+	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", pid);
+	fd = openat(img_dir_fd, fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0) {
+		pr_perror("Cannot create %s", fname);
+		return -1;
+	}
+
+	if (write(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
+		pr_perror("Cannot write header to %s", fname);
+		goto out;
+	}
+
+	if (count > 0 && write(fd, regions, (size_t)count * sizeof(*regions)) !=
+				    (ssize_t)((size_t)count * sizeof(*regions))) {
+		pr_perror("Cannot write region table to %s", fname);
+		goto out;
+	}
+
+	buf = malloc(GPU_IO_CHUNK_SIZE);
+	if (!buf) {
+		pr_err("OOM: cannot allocate IO buffer\n");
+		goto out;
+	}
+
+	for (i = 0; i < count; i++) {
+		uint64_t offset = 0;
+		uint64_t remaining = regions[i].size;
+
+		while (remaining > 0) {
+			size_t chunk = (remaining > GPU_IO_CHUNK_SIZE) ? GPU_IO_CHUNK_SIZE : (size_t)remaining;
+			struct iovec local_iov = { .iov_base = buf, .iov_len = chunk };
+			struct iovec remote_iov = { .iov_base = (void *)(uintptr_t)(regions[i].start + offset),
+						    .iov_len = chunk };
+			ssize_t n, written = 0;
+
+			n = (ssize_t)syscall(SYS_process_vm_readv, (pid_t)pid, &local_iov, 1UL, &remote_iov, 1UL, 0UL);
+			if (n < 0) {
+				pr_perror("process_vm_readv failed for pid %d at 0x%lx", pid,
+					  (unsigned long)(regions[i].start + offset));
+				goto out;
+			}
+
+			while (written < n) {
+				ssize_t w = write(fd, buf + written, (size_t)(n - written));
+
+				if (w < 0) {
+					pr_perror("write to %s failed", fname);
+					goto out;
+				}
+				written += w;
+			}
+			offset += (uint64_t)n;
+			remaining -= (uint64_t)n;
+		}
+	}
+
+	ret = 0;
+	pr_info("Dumped %d GPU regions for pid %d\n", count, pid);
+out:
+	free(buf);
+	close(fd);
+	if (ret != 0)
+		unlinkat(img_dir_fd, fname, 0);
+	return ret;
+}
+
+/*
+ * Free GPU pages from target process via process_madvise(MADV_DONTNEED).
+ * After this, CRIU's page walk sees empty pages and skips them.
+ */
+static int release_gpu_pages(int pid, struct gpu_region *regions, int count)
+{
+	int pidfd, i;
+	struct iovec *iov;
+	long ret;
+
+	pidfd = (int)syscall(SYS_pidfd_open, (pid_t)pid, 0U);
+	if (pidfd < 0) {
+		pr_perror("pidfd_open failed for pid %d", pid);
+		return -1;
+	}
+
+	iov = malloc((size_t)count * sizeof(*iov));
+	if (!iov && count > 0) {
+		pr_err("OOM in release_gpu_pages\n");
+		close(pidfd);
+		return -1;
+	}
+
+	for (i = 0; i < count; i++) {
+		iov[i].iov_base = (void *)(uintptr_t)regions[i].start;
+		iov[i].iov_len = (size_t)regions[i].size;
+	}
+
+	/* MADV_DONTNEED is not supported cross-process on this kernel; use MADV_PAGEOUT
+	 * instead. With no swap, anonymous pages are freed immediately (same effect).
+	 * Requires CAP_SYS_NICE — CRIU always runs as root so this is fine.
+	 */
+	ret = syscall(SYS_process_madvise, pidfd, iov, (unsigned long)count, MADV_PAGEOUT, 0U);
+	free(iov);
+	close(pidfd);
+
+	if (ret < 0) {
+		pr_perror("process_madvise(MADV_PAGEOUT) failed for pid %d", pid);
+		return -1;
+	}
+
+	pr_info("Released %d GPU regions from pid %d via MADV_PAGEOUT\n", count, pid);
+	return 0;
+}
+
+/*
+ * Restore GPU pages from gpu-pages-<pid>.img into the target process.
+ * Called in RESUME_DEVICES_LATE, before cuda-checkpoint restore, so that
+ * cuda-checkpoint can read the pages back from process memory into VRAM.
+ */
+static int restore_gpu_pages(int pid, int img_dir_fd)
+{
+	char fname[64];
+	int fd, ret = -1;
+	struct gpu_pages_hdr hdr;
+	struct gpu_region *regions = NULL;
+	char *buf = NULL;
+	uint32_t i;
+
+	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", pid);
+	fd = openat(img_dir_fd, fname, O_RDONLY);
+	if (fd < 0) {
+		if (errno == ENOENT) {
+			pr_info("No gpu-pages file for pid %d, skipping fast restore\n", pid);
+			return 0;
+		}
+		pr_perror("Cannot open %s", fname);
+		return -1;
+	}
+
+	if (read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
+		pr_perror("Cannot read header from %s", fname);
+		goto out;
+	}
+
+	if (hdr.magic != GPU_PAGES_MAGIC) {
+		pr_err("Bad magic in %s: 0x%x\n", fname, hdr.magic);
+		goto out;
+	}
+
+	if (hdr.num_regions == 0) {
+		ret = 0;
+		goto out;
+	}
+
+	regions = malloc(hdr.num_regions * sizeof(*regions));
+	if (!regions) {
+		pr_err("OOM in restore_gpu_pages\n");
+		goto out;
+	}
+
+	if (read(fd, regions, hdr.num_regions * sizeof(*regions)) !=
+	    (ssize_t)(hdr.num_regions * sizeof(*regions))) {
+		pr_perror("Cannot read region table from %s", fname);
+		goto out;
+	}
+
+	buf = malloc(GPU_IO_CHUNK_SIZE);
+	if (!buf) {
+		pr_err("OOM: cannot allocate IO buffer\n");
+		goto out;
+	}
+
+	for (i = 0; i < hdr.num_regions; i++) {
+		uint64_t offset = 0;
+		uint64_t remaining = regions[i].size;
+
+		while (remaining > 0) {
+			size_t chunk = (remaining > GPU_IO_CHUNK_SIZE) ? GPU_IO_CHUNK_SIZE : (size_t)remaining;
+			ssize_t n = read(fd, buf, chunk);
+			struct iovec local_iov;
+			struct iovec remote_iov;
+
+			if (n <= 0) {
+				pr_perror("read from %s failed", fname);
+				goto out;
+			}
+
+			local_iov.iov_base = buf;
+			local_iov.iov_len = (size_t)n;
+			remote_iov.iov_base = (void *)(uintptr_t)(regions[i].start + offset);
+			remote_iov.iov_len = (size_t)n;
+
+			if ((ssize_t)syscall(SYS_process_vm_writev, (pid_t)pid, &local_iov, 1UL, &remote_iov, 1UL, 0UL) != n) {
+				pr_perror("process_vm_writev failed for pid %d at 0x%lx", pid,
+					  (unsigned long)(regions[i].start + offset));
+				goto out;
+			}
+			offset += (uint64_t)n;
+			remaining -= (uint64_t)n;
+		}
+	}
+
+	ret = 0;
+	pr_info("Restored %u GPU regions for pid %d\n", hdr.num_regions, pid);
+out:
+	free(buf);
+	free(regions);
+	close(fd);
+	return ret;
+}
+
+/* ---- End fast GPU page I/O ---- */
 
 static void dealloc_pid_buffer(struct list_head *pid_buf)
 {
@@ -346,6 +732,8 @@ int cuda_plugin_checkpoint_devices(int pid)
 	k_rtsigset_t save_sigset;
 	struct pid_info *task_info;
 	bool pid_found = false;
+	struct gpu_region *vmas_before = NULL, *vmas_after = NULL, *new_vmas = NULL;
+	int n_before = 0, n_after = 0, n_new = 0;
 
 	if (plugin_disabled) {
 		return -ENOTSUP;
@@ -383,11 +771,16 @@ int cuda_plugin_checkpoint_devices(int pid)
 		return -1;
 	}
 
+	/* Pre-scan: record anonymous private VMAs before cuda-checkpoint moves VRAM */
+	if (scan_anon_private_vmas(pid, &vmas_before, &n_before) != 0)
+		pr_warn("Pre-scan failed for pid %d, fast GPU page dump disabled\n", pid);
+
 	pr_info("Checkpointing CUDA devices on pid %d restore_tid %d\n", pid, restore_tid);
 	/* We need to resume the checkpoint thread to prepare the mappings for
 	 * checkpointing
 	 */
 	if (resume_restore_thread(restore_tid, &save_sigset)) {
+		free(vmas_before);
 		return -1;
 	}
 
@@ -398,6 +791,42 @@ int cuda_plugin_checkpoint_devices(int pid)
 	}
 
 	int_ret = interrupt_restore_thread(restore_tid, &save_sigset);
+
+	/* Fast GPU page dump: find new VMAs created by cuda-checkpoint, dump them
+	 * with process_vm_readv, then free with MADV_DONTNEED so CRIU skips them.
+	 */
+	if (status == 0 && int_ret == 0 && vmas_before != NULL) {
+		int img_dir_fd = criu_get_image_dir();
+
+		if (img_dir_fd < 0) {
+			pr_warn("No image dir fd, skipping fast GPU page dump\n");
+			goto done;
+		}
+		if (scan_anon_private_vmas(pid, &vmas_after, &n_after) != 0) {
+			pr_warn("Post-scan failed for pid %d, skipping fast GPU page dump\n", pid);
+			goto done;
+		}
+		if (diff_anon_vmas(vmas_before, n_before, vmas_after, n_after, &new_vmas, &n_new) != 0) {
+			pr_warn("VMA diff failed for pid %d, skipping fast GPU page dump\n", pid);
+			goto done;
+		}
+		if (n_new == 0) {
+			pr_info("No new GPU VMAs found for pid %d\n", pid);
+			goto done;
+		}
+		pr_info("Found %d new GPU VMAs for pid %d, dumping with process_vm_readv\n", n_new, pid);
+		if (dump_gpu_pages(pid, img_dir_fd, new_vmas, n_new) == 0) {
+			if (release_gpu_pages(pid, new_vmas, n_new) != 0)
+				pr_warn("MADV_DONTNEED failed for pid %d, CRIU will dump GPU pages slowly\n", pid);
+		} else {
+			pr_warn("Fast GPU page dump failed for pid %d, CRIU will dump GPU pages\n", pid);
+		}
+	}
+
+done:
+	free(vmas_before);
+	free(vmas_after);
+	free(new_vmas);
 	return status != 0 ? -1 : int_ret;
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES, cuda_plugin_checkpoint_devices);
@@ -530,8 +959,23 @@ interrupt:
 
 int cuda_plugin_resume_devices_late(int pid)
 {
+	int img_dir_fd;
+
 	if (plugin_disabled) {
 		return -ENOTSUP;
+	}
+
+	/* Restore GPU pages before cuda-checkpoint restore+unlock.
+	 * CRIU has already restored the process VMAs (with empty pages where we
+	 * called MADV_DONTNEED at dump time). We write the actual VRAM data back
+	 * so that cuda-checkpoint can read it and restore VRAM.
+	 */
+	img_dir_fd = criu_get_image_dir();
+	if (img_dir_fd >= 0) {
+		if (restore_gpu_pages(pid, img_dir_fd) != 0)
+			pr_warn("Fast GPU page restore failed for pid %d\n", pid);
+	} else {
+		pr_warn("No image dir fd during restore for pid %d\n", pid);
 	}
 
 	/* RESUME_DEVICES_LATE is used during `criu restore`.
