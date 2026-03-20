@@ -15,12 +15,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/user.h>
 #include <sys/wait.h>
+
+static double now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 /* cuda-checkpoint binary should live in your PATH */
 #define CUDA_CHECKPOINT "cuda-checkpoint"
@@ -78,14 +87,6 @@ static LIST_HEAD(cuda_pids);
  *            process_vm_writev. Then cuda-checkpoint restore reads them from
  *            the process and copies back to VRAM.
  */
-
-#ifndef SYS_pidfd_open
-#define SYS_pidfd_open 434
-#endif
-
-#ifndef SYS_process_madvise
-#define SYS_process_madvise 440
-#endif
 
 #ifndef SYS_process_vm_readv
 #define SYS_process_vm_readv 310
@@ -302,48 +303,153 @@ out:
 }
 
 /*
- * Free GPU pages from target process via process_madvise(MADV_DONTNEED).
- * After this, CRIU's page walk sees empty pages and skips them.
+ * Find a 'syscall' instruction (0x0f 0x05) in the vdso of pid.
+ * Returns the address, or 0 on failure.
  */
-static int release_gpu_pages(int pid, struct gpu_region *regions, int count)
+static uint64_t find_syscall_addr(int pid)
 {
-	int pidfd, i;
-	struct iovec *iov;
-	long ret;
+	char maps_path[64];
+	FILE *f;
+	char line[256];
+	uint64_t vdso_start = 0, vdso_end = 0;
+	uint8_t *buf;
+	size_t vdso_size, i;
+	struct iovec local_iov, remote_iov;
 
-	pidfd = (int)syscall(SYS_pidfd_open, (pid_t)pid, 0U);
-	if (pidfd < 0) {
-		pr_perror("pidfd_open failed for pid %d", pid);
+	snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+	f = fopen(maps_path, "r");
+	if (!f)
+		return 0;
+
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long start, end;
+		char name[64];
+
+		name[0] = '\0';
+		if (sscanf(line, "%lx-%lx %*s %*s %*s %*s %63s", &start, &end, name) >= 2 &&
+		    strcmp(name, "[vdso]") == 0) {
+			vdso_start = start;
+			vdso_end = end;
+			break;
+		}
+	}
+	fclose(f);
+
+	if (!vdso_start)
+		return 0;
+
+	vdso_size = vdso_end - vdso_start;
+	buf = malloc(vdso_size);
+	if (!buf)
+		return 0;
+
+	local_iov.iov_base = buf;
+	local_iov.iov_len = vdso_size;
+	remote_iov.iov_base = (void *)(uintptr_t)vdso_start;
+	remote_iov.iov_len = vdso_size;
+
+	if (syscall(SYS_process_vm_readv, (pid_t)pid, &local_iov, 1UL, &remote_iov, 1UL, 0UL) < 0) {
+		free(buf);
+		return 0;
+	}
+
+	for (i = 0; i + 1 < vdso_size; i++) {
+		if (buf[i] == 0x0f && buf[i + 1] == 0x05) { /* syscall */
+			free(buf);
+			return vdso_start + i;
+		}
+	}
+
+	free(buf);
+	return 0;
+}
+
+/*
+ * Inject madvise(addr, len, MADV_DONTNEED) into the stopped thread 'tid'.
+ * syscall_addr must point to a 'syscall' (0x0f 0x05) instruction in the
+ * target's vdso. The thread must be in ptrace-stop state.
+ */
+static int inject_madvise_dontneed(int tid, uint64_t addr, uint64_t len, uint64_t syscall_addr)
+{
+	struct user_regs_struct saved_regs, regs;
+	struct user_regs_struct after_regs;
+	int status;
+
+	if (ptrace(PTRACE_GETREGS, tid, NULL, &saved_regs) < 0) {
+		pr_perror("PTRACE_GETREGS failed for tid %d", tid);
 		return -1;
 	}
 
-	iov = malloc((size_t)count * sizeof(*iov));
-	if (!iov && count > 0) {
-		pr_err("OOM in release_gpu_pages\n");
-		close(pidfd);
+	regs = saved_regs;
+	regs.rax = 28; /* __NR_madvise */
+	regs.rdi = addr;
+	regs.rsi = len;
+	regs.rdx = MADV_DONTNEED;
+	regs.rip = syscall_addr;
+	regs.orig_rax = (unsigned long long)-1; /* not in a syscall-stop */
+
+	if (ptrace(PTRACE_SETREGS, tid, NULL, &regs) < 0) {
+		pr_perror("PTRACE_SETREGS failed for tid %d", tid);
 		return -1;
 	}
+
+	if (ptrace(PTRACE_SINGLESTEP, tid, NULL, NULL) < 0) {
+		pr_perror("PTRACE_SINGLESTEP failed for tid %d", tid);
+		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+		return -1;
+	}
+
+	if (waitpid(tid, &status, __WALL) < 0) {
+		pr_perror("waitpid after SINGLESTEP failed for tid %d", tid);
+		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+		return -1;
+	}
+
+	if (ptrace(PTRACE_GETREGS, tid, NULL, &after_regs) < 0) {
+		pr_perror("PTRACE_GETREGS after syscall failed for tid %d", tid);
+		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+		return -1;
+	}
+
+	if (ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs) < 0) {
+		pr_perror("PTRACE_SETREGS restore failed for tid %d", tid);
+		return -1;
+	}
+
+	if ((long long)after_regs.rax < 0) {
+		pr_warn("injected madvise(DONTNEED) returned %lld for addr=0x%llx len=%llu\n",
+			(long long)after_regs.rax, (unsigned long long)addr, (unsigned long long)len);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Free GPU pages from the stopped thread 'tid' by injecting madvise(MADV_DONTNEED).
+ * After this, CRIU's page walk sees empty pages and skips them.
+ * tid must be in ptrace-stop state; syscall_addr must be a 'syscall' insn in vdso.
+ */
+static int release_gpu_pages(int tid, uint64_t syscall_addr, struct gpu_region *regions, int count)
+{
+	int i, failed = 0;
 
 	for (i = 0; i < count; i++) {
-		iov[i].iov_base = (void *)(uintptr_t)regions[i].start;
-		iov[i].iov_len = (size_t)regions[i].size;
+		if (inject_madvise_dontneed(tid, regions[i].start, regions[i].size, syscall_addr) != 0) {
+			pr_warn("inject madvise(DONTNEED) failed for region %d (0x%llx+%llu)\n",
+				i, (unsigned long long)regions[i].start,
+				(unsigned long long)regions[i].size);
+			failed++;
+		}
 	}
 
-	/* MADV_DONTNEED is not supported cross-process on this kernel; use MADV_PAGEOUT
-	 * instead. With no swap, anonymous pages are freed immediately (same effect).
-	 * Requires CAP_SYS_NICE — CRIU always runs as root so this is fine.
-	 */
-	ret = syscall(SYS_process_madvise, pidfd, iov, (unsigned long)count, MADV_PAGEOUT, 0U);
-	free(iov);
-	close(pidfd);
+	if (failed == 0)
+		pr_info("Released %d GPU regions via injected madvise(DONTNEED)\n", count);
+	else
+		pr_warn("Released %d/%d GPU regions via injected madvise(DONTNEED)\n",
+			count - failed, count);
 
-	if (ret < 0) {
-		pr_perror("process_madvise(MADV_PAGEOUT) failed for pid %d", pid);
-		return -1;
-	}
-
-	pr_info("Released %d GPU regions from pid %d via MADV_PAGEOUT\n", count, pid);
-	return 0;
+	return (failed == count) ? -1 : 0;
 }
 
 /*
@@ -785,7 +891,11 @@ int cuda_plugin_checkpoint_devices(int pid)
 	}
 
 	task_info->checkpointed = 1;
-	status = cuda_process_checkpoint_action(pid, ACTION_CHECKPOINT, 0, msg_buf, sizeof(msg_buf));
+	{
+		double t0 = now_ms();
+		status = cuda_process_checkpoint_action(pid, ACTION_CHECKPOINT, 0, msg_buf, sizeof(msg_buf));
+		pr_info("[timing] cuda-checkpoint checkpoint: %.0f ms\n", now_ms() - t0);
+	}
 	if (status) {
 		pr_err("CHECKPOINT_DEVICES failed with %s\n", msg_buf);
 	}
@@ -793,15 +903,29 @@ int cuda_plugin_checkpoint_devices(int pid)
 	int_ret = interrupt_restore_thread(restore_tid, &save_sigset);
 
 	/* Fast GPU page dump: find new VMAs created by cuda-checkpoint, dump them
-	 * with process_vm_readv, then free with MADV_DONTNEED so CRIU skips them.
+	 * with process_vm_readv, then free with injected madvise(DONTNEED) so
+	 * CRIU's page walk sees empty pages and skips them.
 	 */
 	if (status == 0 && int_ret == 0 && vmas_before != NULL) {
+		double t0, total_bytes = 0;
 		int img_dir_fd = criu_get_image_dir();
+		uint64_t syscall_addr;
+		int i;
 
 		if (img_dir_fd < 0) {
 			pr_warn("No image dir fd, skipping fast GPU page dump\n");
 			goto done;
 		}
+
+		syscall_addr = find_syscall_addr(pid);
+		if (!syscall_addr) {
+			pr_warn("Could not find syscall insn in vdso for pid %d, skipping fast GPU page dump\n", pid);
+			goto done;
+		}
+		pr_info("Found syscall insn at 0x%llx for pid %d\n",
+			(unsigned long long)syscall_addr, pid);
+
+		t0 = now_ms();
 		if (scan_anon_private_vmas(pid, &vmas_after, &n_after) != 0) {
 			pr_warn("Post-scan failed for pid %d, skipping fast GPU page dump\n", pid);
 			goto done;
@@ -810,14 +934,28 @@ int cuda_plugin_checkpoint_devices(int pid)
 			pr_warn("VMA diff failed for pid %d, skipping fast GPU page dump\n", pid);
 			goto done;
 		}
+		pr_info("[timing] post-scan+diff: %.0f ms, %d new VMAs\n", now_ms() - t0, n_new);
 		if (n_new == 0) {
 			pr_info("No new GPU VMAs found for pid %d\n", pid);
 			goto done;
 		}
-		pr_info("Found %d new GPU VMAs for pid %d, dumping with process_vm_readv\n", n_new, pid);
+		for (i = 0; i < n_new; i++)
+			total_bytes += new_vmas[i].size;
+		pr_info("Found %d new GPU VMAs for pid %d (%.0f MB), dumping with process_vm_readv\n",
+			n_new, pid, total_bytes / (1024 * 1024));
+
+		t0 = now_ms();
 		if (dump_gpu_pages(pid, img_dir_fd, new_vmas, n_new) == 0) {
-			if (release_gpu_pages(pid, new_vmas, n_new) != 0)
-				pr_warn("MADV_DONTNEED failed for pid %d, CRIU will dump GPU pages slowly\n", pid);
+			double dump_ms = now_ms() - t0;
+
+			pr_info("[timing] process_vm_readv dump: %.0f ms (%.1f GB/s)\n",
+				dump_ms, total_bytes / dump_ms / 1e6);
+			t0 = now_ms();
+			if (release_gpu_pages(restore_tid, syscall_addr, new_vmas, n_new) != 0)
+				pr_warn("madvise(DONTNEED) injection failed for pid %d, CRIU will dump GPU pages slowly\n",
+					pid);
+			else
+				pr_info("[timing] injected madvise(DONTNEED): %.0f ms\n", now_ms() - t0);
 		} else {
 			pr_warn("Fast GPU page dump failed for pid %d, CRIU will dump GPU pages\n", pid);
 		}
@@ -972,8 +1110,11 @@ int cuda_plugin_resume_devices_late(int pid)
 	 */
 	img_dir_fd = criu_get_image_dir();
 	if (img_dir_fd >= 0) {
+		double t0 = now_ms();
 		if (restore_gpu_pages(pid, img_dir_fd) != 0)
 			pr_warn("Fast GPU page restore failed for pid %d\n", pid);
+		else
+			pr_info("[timing] process_vm_writev restore: %.0f ms\n", now_ms() - t0);
 	} else {
 		pr_warn("No image dir fd during restore for pid %d\n", pid);
 	}
@@ -983,7 +1124,12 @@ int cuda_plugin_resume_devices_late(int pid)
 	 * to be in a "running" state after restore, even if it was
 	 * in a "locked" or "checkpointed" state during `criu dump`.
 	 */
-	return resume_device(pid, 1, CUDA_TASK_RUNNING);
+	{
+		double t0 = now_ms();
+		int r = resume_device(pid, 1, CUDA_TASK_RUNNING);
+		pr_info("[timing] cuda-checkpoint restore+unlock: %.0f ms\n", now_ms() - t0);
+		return r;
+	}
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, cuda_plugin_resume_devices_late)
 
