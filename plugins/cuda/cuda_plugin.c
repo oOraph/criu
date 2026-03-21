@@ -504,18 +504,21 @@ static int release_gpu_pages(int tid, uint64_t syscall_addr, struct gpu_region *
  * Restore GPU pages into the target process via file-backed mmap + mlock.
  *
  * For each GPU VMA we inject:
- *   mmap(addr, size, PROT_RW, MAP_FIXED|MAP_PRIVATE, fd, file_offset)
+ *   mmap(addr, size, PROT_RW, MAP_FIXED|MAP_SHARED, fd, file_offset)
+ *   madvise(MADV_POPULATE_READ)
  *   mlock(addr, size)
  *
- * MAP_FIXED|MAP_PRIVATE replaces the existing anonymous VMA with a
- * copy-on-write file-backed mapping. mlock() faults all pages in from
- * disk in one sequential read — no extra copy, no ptrace loop.
+ * MAP_FIXED|MAP_SHARED replaces the existing anonymous VMA with a
+ * shared file-backed mapping. MAP_SHARED (not MAP_PRIVATE) avoids COW
+ * page copies during MADV_POPULATE_READ — the kernel maps the existing
+ * file pages directly without allocating new ones.  On warm storage
+ * (tmpfs/page-cache) MADV_POPULATE_READ then completes near-instantly.
  *
- * That's 2 ptrace calls per region regardless of size, vs ~N_CHUNKS
+ * That's 3 ptrace calls per region regardless of size, vs ~N_CHUNKS
  * with the pread64 approach. The kernel handles the bulk I/O itself.
  *
- * After mlock the pages are resident and pinned; cuda-checkpoint's
- * cudaMemcpy reads from them → DMA to VRAM at full PCIe bandwidth.
+ * After mlock the pages are resident and pinned; cuCheckpointProcessRestore
+ * uses a faster (partial DMA) path when reading from locked pages.
  */
 static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 {
@@ -616,10 +619,17 @@ static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_di
 	}
 
 	/*
-	 * For each GPU VMA: remap as MAP_FIXED|MAP_PRIVATE file-backed, then
+	 * For each GPU VMA: remap as MAP_FIXED|MAP_SHARED file-backed, then
 	 * use MADV_POPULATE_READ to fault all pages in from disk synchronously
 	 * in one sequential pass (no RLIMIT_MEMLOCK needed, unlike mlock).
 	 * Then attempt mlock as best-effort to pin pages for DMA.
+	 *
+	 * MAP_SHARED (not MAP_PRIVATE) avoids COW page copies: with MAP_PRIVATE
+	 * MADV_POPULATE_READ triggers copy-on-write allocation for every page
+	 * (~1.5 GB/s, same cost as a CPU copy).  MAP_SHARED maps the existing
+	 * file pages directly (zero data movement) — MADV_POPULATE_READ is then
+	 * near-instant on warm storage (tmpfs/page-cache).  cuda-checkpoint only
+	 * reads these pages (copies to VRAM), so shared visibility is safe.
 	 *
 	 * File offsets and VMA addresses are always page-aligned (kernel VMAs),
 	 * and GPU_PAGES_DATA_OFFSET=4096 is one page — mmap offset constraint
@@ -630,8 +640,8 @@ static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_di
 		long mapped = inject_syscall(tid, syscall_addr, SYS_mmap,
 					     (long)regions[i].start,
 					     (long)regions[i].size,
-					     PROT_READ | PROT_WRITE,
-					     MAP_FIXED | MAP_PRIVATE,
+					     PROT_READ,
+					     MAP_FIXED | MAP_SHARED,
 					     target_fd,
 					     (long)file_offset);
 		if (mapped != (long)regions[i].start) {
