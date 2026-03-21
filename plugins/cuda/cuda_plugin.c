@@ -19,6 +19,7 @@
 #include <limits.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -112,6 +113,8 @@ static LIST_HEAD(cuda_pids);
 
 #define GPU_PAGES_MAGIC	  0x47505544u /* "GPUD" */
 #define GPU_IO_CHUNK_SIZE (64 * 1024 * 1024)
+/* Page data starts at this offset in the image file (page-aligned for mmap) */
+#define GPU_PAGES_DATA_OFFSET 4096
 
 struct gpu_region {
 	uint64_t start;
@@ -265,6 +268,12 @@ static int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, i
 	if (count > 0 && write(fd, regions, (size_t)count * sizeof(*regions)) !=
 				    (ssize_t)((size_t)count * sizeof(*regions))) {
 		pr_perror("Cannot write region table to %s", fname);
+		goto out;
+	}
+
+	/* Seek to page-aligned offset so page data can be mmap'd directly */
+	if (lseek(fd, GPU_PAGES_DATA_OFFSET, SEEK_SET) != GPU_PAGES_DATA_OFFSET) {
+		pr_perror("lseek to data offset failed");
 		goto out;
 	}
 
@@ -484,22 +493,36 @@ static int release_gpu_pages(int tid, uint64_t syscall_addr, struct gpu_region *
 }
 
 /*
- * Restore GPU pages from gpu-pages-<pid>.img into the target process
- * via process_vm_writev. Called before cuda-checkpoint restore so that
- * cuda-checkpoint can read the pages back from process memory into VRAM.
+ * Restore GPU pages by injecting file-backed mmap into the target process.
+ *
+ * Instead of copying data via process_vm_writev, we:
+ * 1. Resolve the absolute path of gpu-pages-<pid>.img (via /proc/self/fd/<img_dir_fd>).
+ * 2. Write the path into the target's stack below the red zone.
+ * 3. Inject openat() → target opens the file (plain fs open, no ptrace check needed).
+ * 4. For each GPU VMA: inject mmap(MAP_FIXED|MAP_PRIVATE) to back it with the file.
+ * 5. Inject mlock() to pre-fault all pages into RAM immediately.
+ * 6. Inject close().
+ *
+ * cuda-checkpoint restore then reads from mlocked resident pages and copies to VRAM
+ * via cudaMemcpy — same pinned-memory path as ZeroGPU, without the extra CRIU→target
+ * copy that process_vm_writev required.
  */
-static int restore_gpu_pages(int pid, int img_dir_fd)
+static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 {
 	char fname[64];
-	int fd, ret = -1;
+	char img_dir_path[PATH_MAX - 64];
+	char file_path[PATH_MAX];
+	char proc_link[64];
+	int img_fd = -1, ret = -1;
 	struct gpu_pages_hdr hdr;
 	struct gpu_region *regions = NULL;
-	char *buf = NULL;
+	uint64_t total_size = 0, file_offset;
 	uint32_t i;
+	long target_fd;
 
 	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", pid);
-	fd = openat(img_dir_fd, fname, O_RDONLY);
-	if (fd < 0) {
+	img_fd = openat(img_dir_fd, fname, O_RDONLY);
+	if (img_fd < 0) {
 		if (errno == ENOENT) {
 			pr_info("No gpu-pages file for pid %d, skipping\n", pid);
 			return 0;
@@ -508,13 +531,9 @@ static int restore_gpu_pages(int pid, int img_dir_fd)
 		return -1;
 	}
 
-	if (read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
-		pr_perror("Cannot read header from %s", fname);
-		goto out;
-	}
-
-	if (hdr.magic != GPU_PAGES_MAGIC) {
-		pr_err("Bad magic in %s: 0x%x\n", fname, hdr.magic);
+	if (read(img_fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) ||
+	    hdr.magic != GPU_PAGES_MAGIC) {
+		pr_err("Bad header in %s\n", fname);
 		goto out;
 	}
 
@@ -528,55 +547,96 @@ static int restore_gpu_pages(int pid, int img_dir_fd)
 		pr_err("OOM in restore_gpu_pages\n");
 		goto out;
 	}
-
-	if (read(fd, regions, hdr.num_regions * sizeof(*regions)) !=
+	if (read(img_fd, regions, hdr.num_regions * sizeof(*regions)) !=
 	    (ssize_t)(hdr.num_regions * sizeof(*regions))) {
-		pr_perror("Cannot read region table from %s", fname);
+		pr_perror("Cannot read region table");
 		goto out;
 	}
+	for (i = 0; i < hdr.num_regions; i++)
+		total_size += regions[i].size;
 
-	buf = malloc(GPU_IO_CHUNK_SIZE);
-	if (!buf) {
-		pr_err("OOM: cannot allocate IO buffer\n");
-		goto out;
-	}
+	/*
+	 * Resolve absolute path of the image file so the target can open it.
+	 * After nsenter -m, /proc/self refers to CRIU, and img_dir_fd is a
+	 * valid fd in CRIU's fd table visible at /proc/self/fd/<n>.
+	 */
+	snprintf(proc_link, sizeof(proc_link), "/proc/self/fd/%d", img_dir_fd);
+	{
+		ssize_t n = readlink(proc_link, img_dir_path, sizeof(img_dir_path) - 1);
 
-	for (i = 0; i < hdr.num_regions; i++) {
-		uint64_t offset = 0;
-		uint64_t remaining = regions[i].size;
-
-		while (remaining > 0) {
-			size_t chunk = (remaining > GPU_IO_CHUNK_SIZE) ? GPU_IO_CHUNK_SIZE : (size_t)remaining;
-			ssize_t n = read(fd, buf, chunk);
-			struct iovec local_iov, remote_iov;
-
-			if (n <= 0) {
-				pr_perror("read from %s failed", fname);
-				goto out;
-			}
-
-			local_iov.iov_base = buf;
-			local_iov.iov_len = (size_t)n;
-			remote_iov.iov_base = (void *)(uintptr_t)(regions[i].start + offset);
-			remote_iov.iov_len = (size_t)n;
-
-			if ((ssize_t)syscall(SYS_process_vm_writev, (pid_t)pid,
-					     &local_iov, 1UL, &remote_iov, 1UL, 0UL) != n) {
-				pr_perror("process_vm_writev failed for pid %d at 0x%lx",
-					  pid, (unsigned long)(regions[i].start + offset));
-				goto out;
-			}
-			offset += (uint64_t)n;
-			remaining -= (uint64_t)n;
+		if (n < 0) {
+			pr_perror("readlink %s failed", proc_link);
+			goto out;
 		}
+		img_dir_path[n] = '\0';
+	}
+	snprintf(file_path, sizeof(file_path), "%s/%s", img_dir_path, fname);
+	pr_info("GPU pages file path: %s\n", file_path);
+
+	/* Write path into target's stack (below the 128-byte x86-64 red zone) */
+	{
+		struct user_regs_struct regs;
+		struct iovec local_iov, remote_iov;
+		uint64_t path_addr;
+		size_t path_len = strlen(file_path) + 1;
+
+		if (ptrace(PTRACE_GETREGS, tid, NULL, &regs) < 0) {
+			pr_perror("PTRACE_GETREGS failed");
+			goto out;
+		}
+		path_addr = regs.rsp - 256;
+
+		local_iov.iov_base = file_path;
+		local_iov.iov_len = path_len;
+		remote_iov.iov_base = (void *)(uintptr_t)path_addr;
+		remote_iov.iov_len = path_len;
+		if (syscall(SYS_process_vm_writev, (pid_t)tid, &local_iov, 1UL,
+			    &remote_iov, 1UL, 0UL) != (ssize_t)path_len) {
+			pr_perror("process_vm_writev path failed");
+			goto out;
+		}
+
+		/* Plain fs open — no ptrace permission check, no /proc/pid/fd trick */
+		target_fd = inject_syscall(tid, syscall_addr, SYS_openat,
+					   (long)AT_FDCWD, (long)path_addr,
+					   O_RDONLY, 0, 0, 0);
 	}
 
+	if (target_fd < 0) {
+		pr_err("openat injection failed: %ld\n", target_fd);
+		goto out;
+	}
+
+	/*
+	 * Remap each GPU VMA to the file at the correct offset.
+	 * MAP_FIXED replaces the empty anon pages CRIU restored.
+	 * MAP_PRIVATE: CoW, writes don't go back to the image file.
+	 */
+	file_offset = GPU_PAGES_DATA_OFFSET;
+	for (i = 0; i < hdr.num_regions; i++) {
+		long mmap_ret = inject_syscall(tid, syscall_addr, SYS_mmap,
+					       (long)regions[i].start,
+					       (long)regions[i].size,
+					       PROT_READ | PROT_WRITE,
+					       MAP_FIXED | MAP_PRIVATE | MAP_POPULATE,
+					       target_fd,
+					       (long)file_offset);
+		if ((uint64_t)mmap_ret != regions[i].start) {
+			pr_err("mmap injection failed for region %u: 0x%lx\n", i, mmap_ret);
+			inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
+			goto out;
+		}
+		file_offset += regions[i].size;
+	}
+
+	inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
+	pr_info("Remapped %u GPU regions for pid %d via file mmap (zero extra copy)\n",
+		hdr.num_regions, pid);
 	ret = 0;
-	pr_info("Restored %u GPU regions for pid %d\n", hdr.num_regions, pid);
 out:
-	free(buf);
 	free(regions);
-	close(fd);
+	if (img_fd >= 0)
+		close(img_fd);
 	return ret;
 }
 
@@ -1129,27 +1189,29 @@ interrupt:
 int cuda_plugin_resume_devices_late(int pid)
 {
 	int img_dir_fd;
+	int restore_tid;
+	uint64_t syscall_addr;
 
 	if (plugin_disabled) {
 		return -ENOTSUP;
 	}
 
 	img_dir_fd = criu_get_image_dir();
+	restore_tid = get_cuda_restore_tid(pid);
 
-	/* Restore GPU pages before cuda-checkpoint restore+unlock.
-	 * CRIU has already restored the process VMAs (with empty pages where we
-	 * called MADV_DONTNEED at dump time). We remap those VMAs to a memfd
-	 * pre-loaded with the GPU page data — zero CPU copy — so that
-	 * cuda-checkpoint restore reads from mlocked pages and copies to VRAM.
-	 */
-	if (img_dir_fd >= 0) {
-		double t0 = now_ms();
+	if (img_dir_fd >= 0 && restore_tid != -1) {
+		syscall_addr = find_syscall_addr(pid);
+		if (!syscall_addr) {
+			pr_warn("Could not find syscall insn in vdso for pid %d\n", pid);
+		} else {
+			double t0 = now_ms();
 
-		if (restore_gpu_pages(pid, img_dir_fd) != 0)
-			pr_warn("Fast GPU page restore failed for pid %d\n", pid);
-		else
-			pr_info("[timing] process_vm_writev restore: %.0f ms\n", now_ms() - t0);
-	} else {
+			if (restore_gpu_pages(pid, restore_tid, syscall_addr, img_dir_fd) != 0)
+				pr_warn("memfd remap restore failed for pid %d\n", pid);
+			else
+				pr_info("[timing] memfd remap restore: %.0f ms\n", now_ms() - t0);
+		}
+	} else if (img_dir_fd < 0) {
 		pr_warn("No image dir fd during restore for pid %d\n", pid);
 	}
 
