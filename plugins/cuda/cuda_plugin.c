@@ -501,38 +501,44 @@ static int release_gpu_pages(int tid, uint64_t syscall_addr, struct gpu_region *
 }
 
 /*
- * Restore GPU pages into the target process via file-backed mmap + mlock.
+ * Restore GPU pages into the target process via memfd + zero-copy mmap (Option A).
  *
- * For each GPU VMA we inject:
- *   mmap(addr, size, PROT_RW, MAP_FIXED|MAP_SHARED, fd, file_offset)
- *   madvise(MADV_POPULATE_READ)
- *   mlock(addr, size)
+ * All disk I/O happens in CRIU's own process — no ptrace for page loading:
  *
- * MAP_FIXED|MAP_SHARED replaces the existing anonymous VMA with a
- * shared file-backed mapping. MAP_SHARED (not MAP_PRIVATE) avoids COW
- * page copies during MADV_POPULATE_READ — the kernel maps the existing
- * file pages directly without allocating new ones.  On warm storage
- * (tmpfs/page-cache) MADV_POPULATE_READ then completes near-instantly.
+ *   1. Create a memfd in CRIU, ftruncate to total GPU data size.
+ *   2. Read gpu-pages-<pid>.img into the memfd mapping (sequential read,
+ *      no ptrace round-trips).
+ *   3. mlock the memfd mapping in CRIU — pages are physically resident and
+ *      pinned before any injection into the target.
+ *   4. Share the memfd with the target via /proc/<criu_pid>/fd/<memfd_fd>:
+ *      inject openat() into target to get target_fd.
+ *   5. For each GPU VMA: inject mmap(MAP_FIXED|MAP_SHARED, target_fd, offset)
+ *      — zero-copy page-table update; the target's VMA now points to the same
+ *      physical pages already loaded and pinned by CRIU.
+ *   6. Inject mlock() in target — keeps pages pinned after CRIU releases its
+ *      mapping on return (requires --ulimit memlock=-1 on restore container).
  *
- * That's 3 ptrace calls per region regardless of size, vs ~N_CHUNKS
- * with the pread64 approach. The kernel handles the bulk I/O itself.
+ * This replaces MADV_POPULATE_READ injection (I/O in target context, 3 ptrace
+ * calls per region for mmap+advise+mlock) with a single mmap+mlock injection
+ * after the I/O is already done in CRIU.  Pages are physically resident when
+ * target's mmap runs, so mlock in the target is near-instant.
  *
- * After mlock the pages are resident and pinned; cuCheckpointProcessRestore
- * uses a faster (partial DMA) path when reading from locked pages.
+ * cuCheckpointProcessRestore reads from the target's VMA (mlocked pages) into
+ * VRAM.  With physically pinned pages CUDA can issue a direct DMA command
+ * rather than bouncing through a temporary buffer.
  */
 static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 {
 	char fname[64];
-	char img_dir_path[PATH_MAX - 64];
-	char file_path[PATH_MAX];
-	char proc_link[64];
-	int img_fd = -1, ret = -1;
+	int img_fd = -1, memfd_fd = -1, ret = -1;
+	void *criu_map = MAP_FAILED;
 	struct gpu_pages_hdr hdr;
 	struct gpu_region *regions = NULL;
-	uint64_t file_offset;
+	uint64_t total_data_size = 0, file_offset;
 	uint32_t i;
 	long target_fd;
 	uint64_t path_addr;
+	char proc_path[64];
 
 	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", pid);
 	img_fd = openat(img_dir_fd, fname, O_RDONLY);
@@ -566,31 +572,73 @@ static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_di
 		pr_perror("Cannot read region table");
 		goto out;
 	}
+
+	for (i = 0; i < hdr.num_regions; i++)
+		total_data_size += regions[i].size;
+
+	/*
+	 * Create memfd in CRIU's process: ftruncate to header area + page data,
+	 * map it, read all GPU page data from the image file into the mapping.
+	 * mlock pins the pages so they are physically resident before sharing.
+	 */
+	memfd_fd = (int)syscall(SYS_memfd_create, "gpu-pages", (unsigned int)MFD_CLOEXEC);
+	if (memfd_fd < 0) {
+		pr_perror("memfd_create failed");
+		goto out;
+	}
+	if (ftruncate(memfd_fd, (off_t)(GPU_PAGES_DATA_OFFSET + total_data_size)) < 0) {
+		pr_perror("ftruncate memfd failed");
+		goto out;
+	}
+
+	criu_map = mmap(NULL, GPU_PAGES_DATA_OFFSET + total_data_size,
+			PROT_READ | PROT_WRITE, MAP_SHARED, memfd_fd, 0);
+	if (criu_map == MAP_FAILED) {
+		pr_perror("mmap memfd in CRIU failed");
+		goto out;
+	}
+
+	/* Read page data at GPU_PAGES_DATA_OFFSET to match the on-disk layout */
+	if (lseek(img_fd, GPU_PAGES_DATA_OFFSET, SEEK_SET) != GPU_PAGES_DATA_OFFSET) {
+		pr_perror("lseek to data offset in gpu-pages img failed");
+		goto out;
+	}
+	{
+		char *dst = (char *)criu_map + GPU_PAGES_DATA_OFFSET;
+		size_t remaining = (size_t)total_data_size;
+
+		while (remaining > 0) {
+			ssize_t n = read(img_fd, dst, remaining);
+
+			if (n <= 0) {
+				pr_perror("read gpu-pages data failed");
+				goto out;
+			}
+			dst += n;
+			remaining -= (size_t)n;
+		}
+	}
 	close(img_fd);
 	img_fd = -1;
 
+	if (mlock((char *)criu_map + GPU_PAGES_DATA_OFFSET, (size_t)total_data_size) < 0)
+		pr_warn("mlock of memfd in CRIU failed (RLIMIT_MEMLOCK?): %m\n");
+
 	/*
-	 * Resolve the image file's absolute path so the target process can
-	 * open it via its own openat() — the fd lives in the target's fd table.
+	 * Expose the memfd to the target via /proc/<criu_pid>/fd/<memfd_fd>.
+	 * The target injects openat() on this path to get its own reference.
+	 * We retain our memfd_fd (and criu_map mlock) until after all injections
+	 * complete, so pages stay pinned throughout.
 	 */
-	snprintf(proc_link, sizeof(proc_link), "/proc/self/fd/%d", img_dir_fd);
-	{
-		ssize_t n = readlink(proc_link, img_dir_path, sizeof(img_dir_path) - 1);
+	snprintf(proc_path, sizeof(proc_path), "/proc/%d/fd/%d", getpid(), memfd_fd);
+	pr_info("Sharing GPU pages memfd via %s (%lu MB)\n",
+		proc_path, (unsigned long)(total_data_size >> 20));
 
-		if (n < 0) {
-			pr_perror("readlink %s failed", proc_link);
-			goto out;
-		}
-		img_dir_path[n] = '\0';
-	}
-	snprintf(file_path, sizeof(file_path), "%s/%s", img_dir_path, fname);
-	pr_info("GPU pages file: %s\n", file_path);
-
-	/* Write path into target's stack (below the 128-byte x86-64 ABI red zone) */
+	/* Write the proc path into target's stack (below the x86-64 ABI red zone) */
 	{
 		struct user_regs_struct regs;
 		struct iovec local_iov, remote_iov;
-		size_t path_len = strlen(file_path) + 1;
+		size_t path_len = strlen(proc_path) + 1;
 
 		if (ptrace(PTRACE_GETREGS, tid, NULL, &regs) < 0) {
 			pr_perror("PTRACE_GETREGS failed");
@@ -598,7 +646,7 @@ static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_di
 		}
 		path_addr = regs.rsp - 256;
 
-		local_iov.iov_base = file_path;
+		local_iov.iov_base = proc_path;
 		local_iov.iov_len = path_len;
 		remote_iov.iov_base = (void *)(uintptr_t)path_addr;
 		remote_iov.iov_len = path_len;
@@ -614,26 +662,17 @@ static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_di
 	}
 
 	if (target_fd < 0) {
-		pr_err("openat injection failed: %ld\n", target_fd);
+		pr_err("openat injection for memfd path failed: %ld\n", target_fd);
 		goto out;
 	}
 
 	/*
-	 * For each GPU VMA: remap as MAP_FIXED|MAP_SHARED file-backed, then
-	 * use MADV_POPULATE_READ to fault all pages in from disk synchronously
-	 * in one sequential pass (no RLIMIT_MEMLOCK needed, unlike mlock).
-	 * Then attempt mlock as best-effort to pin pages for DMA.
+	 * For each GPU VMA: zero-copy page-table remap to the memfd pages,
+	 * then mlock in target to keep them pinned once CRIU's mlock is
+	 * released on return.  Pages are already resident — mlock is fast.
 	 *
-	 * MAP_SHARED (not MAP_PRIVATE) avoids COW page copies: with MAP_PRIVATE
-	 * MADV_POPULATE_READ triggers copy-on-write allocation for every page
-	 * (~1.5 GB/s, same cost as a CPU copy).  MAP_SHARED maps the existing
-	 * file pages directly (zero data movement) — MADV_POPULATE_READ is then
-	 * near-instant on warm storage (tmpfs/page-cache).  cuda-checkpoint only
-	 * reads these pages (copies to VRAM), so shared visibility is safe.
-	 *
-	 * File offsets and VMA addresses are always page-aligned (kernel VMAs),
-	 * and GPU_PAGES_DATA_OFFSET=4096 is one page — mmap offset constraint
-	 * (must be page-aligned) is always satisfied.
+	 * No MADV_POPULATE_READ: pages were faulted in when CRIU read the
+	 * image data into criu_map above.
 	 */
 	file_offset = GPU_PAGES_DATA_OFFSET;
 	for (i = 0; i < hdr.num_regions; i++) {
@@ -645,21 +684,12 @@ static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_di
 					     target_fd,
 					     (long)file_offset);
 		if (mapped != (long)regions[i].start) {
-			pr_err("mmap injection failed for region %u: got 0x%lx, expected 0x%llx\n",
+			pr_err("mmap injection failed for region %u: got 0x%lx expected 0x%llx\n",
 			       i, mapped, (unsigned long long)regions[i].start);
 			inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
 			goto out;
 		}
 
-		/*
-		 * MADV_POPULATE_READ faults all pages in synchronously from the
-		 * file — no RLIMIT_MEMLOCK needed.  Pages are in RAM after this.
-		 * mlock follows as best-effort to pin them for DMA (may fail if
-		 * RLIMIT_MEMLOCK is too small; pages are still warm in RAM).
-		 */
-		inject_syscall(tid, syscall_addr, SYS_madvise,
-			       (long)regions[i].start, (long)regions[i].size,
-			       MADV_POPULATE_READ, 0, 0, 0);
 		inject_syscall(tid, syscall_addr, SYS_mlock,
 			       (long)regions[i].start, (long)regions[i].size,
 			       0, 0, 0, 0);
@@ -668,11 +698,15 @@ static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_di
 	}
 
 	inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
-	pr_info("Loaded %u GPU regions for pid %d via file-backed mmap + mlock\n",
+	pr_info("Loaded %u GPU regions for pid %d via memfd zero-copy mmap + mlock\n",
 		hdr.num_regions, pid);
 	ret = 0;
 out:
 	free(regions);
+	if (criu_map != MAP_FAILED)
+		munmap(criu_map, GPU_PAGES_DATA_OFFSET + total_data_size);
+	if (memfd_fd >= 0)
+		close(memfd_fd);
 	if (img_fd >= 0)
 		close(img_fd);
 	return ret;
