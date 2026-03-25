@@ -566,9 +566,6 @@ static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_di
 		pr_perror("Cannot read region table");
 		goto out;
 	}
-	close(img_fd);
-	img_fd = -1;
-
 	/*
 	 * Resolve the image file's absolute path so the target process can
 	 * open it via its own openat() — the fd lives in the target's fd table.
@@ -616,6 +613,35 @@ static int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_di
 	if (target_fd < 0) {
 		pr_err("openat injection failed: %ld\n", target_fd);
 		goto out;
+	}
+
+	/*
+	 * Prefetch: warm the page cache for all GPU data in one sequential
+	 * pass from CRIU's address space before the ptrace injection loop.
+	 * Since the target's mmap uses MAP_SHARED on the same file, the page
+	 * cache is shared — the target's MADV_POPULATE_READ calls will find
+	 * all pages already resident (page table update only, no disk IO).
+	 * Falls back gracefully (warning only) if mmap or madvise fails.
+	 */
+	{
+		uint64_t total_data_size = 0;
+		void *prefetch_map;
+
+		for (i = 0; i < hdr.num_regions; i++)
+			total_data_size += regions[i].size;
+
+		if (total_data_size > 0) {
+			prefetch_map = mmap(NULL, (size_t)total_data_size, PROT_READ,
+					    MAP_SHARED, img_fd, GPU_PAGES_DATA_OFFSET);
+			if (prefetch_map != MAP_FAILED) {
+				if (madvise(prefetch_map, (size_t)total_data_size,
+					    MADV_POPULATE_READ) < 0)
+					pr_warn("GPU prefetch madvise failed: %m\n");
+				munmap(prefetch_map, (size_t)total_data_size);
+			} else {
+				pr_warn("GPU prefetch mmap failed: %m\n");
+			}
+		}
 	}
 
 	/*
