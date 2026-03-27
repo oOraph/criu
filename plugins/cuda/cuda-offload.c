@@ -23,6 +23,7 @@
  *   cuda-offload --pid PID --dir DIR --action restore
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -39,6 +40,38 @@
 				    ##__VA_ARGS__, strerror(errno))
 
 #include "cuda_gpu_pages.h"
+
+/* ---- helpers ---- */
+
+/*
+ * Scan dir_fd for a gpu-pages-<pid>.img file and return the pid found in the
+ * filename. Returns -1 if not found. Used on restore when the current PID
+ * differs from the checkpoint PID (e.g. after criu restore).
+ */
+static int find_img_pid(int dir_fd)
+{
+	DIR *dir;
+	struct dirent *ent;
+	int img_pid = -1;
+	int fd;
+
+	fd = dup(dir_fd);
+	if (fd < 0)
+		return -1;
+	dir = fdopendir(fd);
+	if (!dir) {
+		close(fd);
+		return -1;
+	}
+
+	while ((ent = readdir(dir)) != NULL) {
+		if (sscanf(ent->d_name, "gpu-pages-%d.img", &img_pid) == 1)
+			break;
+		img_pid = -1;
+	}
+	closedir(dir);
+	return img_pid;
+}
 
 /* ---- cuda-checkpoint runner ---- */
 
@@ -255,9 +288,18 @@ checkpoint_done:
 			return 1;
 		}
 
-		/* 2. Remap GPU VMAs from the image file (zero-copy page-table remap) */
+		/* 2. Remap GPU VMAs from the image file (zero-copy page-table remap).
+		 * The image filename uses the checkpoint PID which may differ from
+		 * the current PID after criu restore — scan the dir to find it. */
+		int img_pid = find_img_pid(img_dir_fd);
+		if (img_pid < 0) {
+			pr_err("No gpu-pages-*.img found in %s\n", dir);
+			close(img_dir_fd);
+			ptrace_resume(pid);
+			return 1;
+		}
 		t0 = now_ms();
-		if (restore_gpu_pages(pid, pid, syscall_addr, img_dir_fd) != 0) {
+		if (restore_gpu_pages(pid, img_pid, syscall_addr, img_dir_fd) != 0) {
 			close(img_dir_fd);
 			ptrace_resume(pid);
 			return 1;
