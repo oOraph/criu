@@ -46,6 +46,10 @@
 #define O_DIRECT 040000 /* Linux x86-64 */
 #endif
 
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 14
+#endif
+
 #define pr_info(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: " fmt, ##__VA_ARGS__)
 #define pr_warn(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: WARNING: " fmt, ##__VA_ARGS__)
 #define pr_err(fmt, ...)    fprintf(stderr, "cuda_gpu_pages: ERROR: " fmt, ##__VA_ARGS__)
@@ -575,6 +579,16 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	file_offset = GPU_PAGES_DATA_OFFSET;
 	for (i = 0; i < hdr.num_regions; i++) {
 		uint64_t region_done = 0;
+
+		/*
+		 * Ask the kernel to use 2MB transparent huge pages for this
+		 * VMA.  With 2MB pages the NVMe scatter-gather list has ~3200
+		 * entries instead of ~1.6M for 4KB pages, allowing the NVMe
+		 * controller to DMA at full sequential bandwidth.
+		 */
+		inject_syscall(tid, syscall_addr, SYS_madvise,
+			       (long)regions[i].start, (long)regions[i].size,
+			       MADV_HUGEPAGE, 0, 0, 0);
 
 		/* Pre-fault + pin pages before the O_DIRECT read */
 		inject_syscall(tid, syscall_addr, SYS_mlock,
