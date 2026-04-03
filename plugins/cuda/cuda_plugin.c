@@ -665,9 +665,9 @@ int cuda_plugin_resume_devices_late(int pid)
 			double t0 = now_ms();
 
 			if (restore_gpu_pages(pid, restore_tid, syscall_addr, img_dir_fd) != 0)
-				pr_warn("pread+writev restore failed for pid %d\n", pid);
+				pr_warn("mmap restore failed for pid %d\n", pid);
 			else
-				pr_info("[timing] pread+writev restore: %.0f ms\n", now_ms() - t0);
+				pr_info("[timing] mmap+mlock restore: %.0f ms\n", now_ms() - t0);
 		}
 	} else if (img_dir_fd < 0) {
 		pr_warn("No image dir fd during restore for pid %d\n", pid);
