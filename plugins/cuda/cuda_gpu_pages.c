@@ -38,6 +38,14 @@
 #define MADV_POPULATE_READ 22
 #endif
 
+#ifndef SYS_pread64
+#define SYS_pread64 17
+#endif
+
+#ifndef O_DIRECT
+#define O_DIRECT 040000 /* Linux x86-64 */
+#endif
+
 #define pr_info(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: " fmt, ##__VA_ARGS__)
 #define pr_warn(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: WARNING: " fmt, ##__VA_ARGS__)
 #define pr_err(fmt, ...)    fprintf(stderr, "cuda_gpu_pages: ERROR: " fmt, ##__VA_ARGS__)
@@ -420,21 +428,29 @@ int release_gpu_pages(int tid, uint64_t syscall_addr, struct gpu_region *regions
 }
 
 /*
- * Restore GPU pages into the target process via file-backed mmap + mlock.
+ * Restore GPU pages into the target process via injected O_DIRECT pread64.
+ *
+ * Instead of mmap(MAP_SHARED)+MADV_POPULATE_READ (which reads through the
+ * page cache at ~1.5 GB/s due to per-page kernel overhead), we inject
+ * O_DIRECT pread64 calls directly into the target's existing anonymous VMAs.
+ *
+ * O_DIRECT programs the NVMe controller to DMA data straight into the
+ * target's physical pages — no page cache, no intermediate copy, no per-page
+ * fault overhead.  Expected throughput: ~3 GB/s (raw NVMe sequential read).
  *
  * For each GPU VMA we inject:
- *   mmap(addr, size, PROT_READ, MAP_FIXED|MAP_SHARED, fd, file_offset)
- *   madvise(MADV_POPULATE_READ)
- *   mlock(addr, size)
+ *   openat(O_RDONLY|O_DIRECT)            — once, reused across regions
+ *   pread64(fd, vma_addr, chunk, offset)  — N chunks per region
+ *   mlock(vma_addr, size)                — pin pages for cuda-checkpoint DMA
+ *   close(fd)                            — once at the end
  *
- * MAP_FIXED|MAP_SHARED replaces the existing anonymous VMA with a
- * shared file-backed mapping. MAP_SHARED (not MAP_PRIVATE) avoids COW
- * page copies during MADV_POPULATE_READ — the kernel maps the existing
- * file pages directly without allocating new ones.  On warm storage
- * (tmpfs/page-cache) MADV_POPULATE_READ then completes near-instantly.
+ * O_DIRECT alignment requirements (all guaranteed):
+ *   buffer: VMA addresses are page-aligned (4096)
+ *   count:  region sizes are page multiples; chunk = GPU_IO_CHUNK_SIZE (64 MB)
+ *   offset: GPU_PAGES_DATA_OFFSET = 4096; all region offsets are page multiples
  *
- * After mlock the pages are resident and pinned; cuCheckpointProcessRestore
- * uses a faster (partial DMA) path when reading from locked pages.
+ * If O_DIRECT is not supported (EINVAL), fall back to plain O_RDONLY so the
+ * injection still works (at page-cache speed, same as the old mmap approach).
  */
 int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 {
@@ -445,10 +461,11 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	int img_fd = -1, ret = -1;
 	struct gpu_pages_hdr hdr;
 	struct gpu_region *regions = NULL;
-	uint64_t file_offset;
+	uint64_t file_offset, total_bytes = 0;
 	uint32_t i;
 	long target_fd;
 	uint64_t path_addr;
+	double t0;
 
 	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", pid);
 	img_fd = openat(img_dir_fd, fname, O_RDONLY);
@@ -487,7 +504,7 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 
 	/*
 	 * Resolve the image file's absolute path so the target process can
-	 * open it via its own openat() — the fd lives in the target's fd table.
+	 * open it via its own openat().
 	 */
 	snprintf(proc_link, sizeof(proc_link), "/proc/self/fd/%d", img_dir_fd);
 	{
@@ -524,9 +541,20 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 			goto out;
 		}
 
+		/*
+		 * Try O_DIRECT first.  If the filesystem rejects it (EINVAL),
+		 * fall back to buffered I/O — the pread loop below works either
+		 * way, just at page-cache speed instead of NVMe DMA speed.
+		 */
 		target_fd = inject_syscall(tid, syscall_addr, SYS_openat,
 					   (long)AT_FDCWD, (long)path_addr,
-					   O_RDONLY, 0, 0, 0);
+					   O_RDONLY | O_DIRECT, 0, 0, 0);
+		if (target_fd == -EINVAL) {
+			pr_info("O_DIRECT not supported, falling back to buffered I/O\n");
+			target_fd = inject_syscall(tid, syscall_addr, SYS_openat,
+						   (long)AT_FDCWD, (long)path_addr,
+						   O_RDONLY, 0, 0, 0);
+		}
 	}
 
 	if (target_fd < 0) {
@@ -535,47 +563,41 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	}
 
 	/*
-	 * For each GPU VMA: remap as MAP_FIXED|MAP_SHARED file-backed, then
-	 * use MADV_POPULATE_READ to fault all pages in from disk synchronously
-	 * in one sequential pass (no RLIMIT_MEMLOCK needed, unlike mlock).
-	 * Then attempt mlock as best-effort to pin pages for DMA.
-	 *
-	 * MAP_SHARED (not MAP_PRIVATE) avoids COW page copies: with MAP_PRIVATE
-	 * MADV_POPULATE_READ triggers copy-on-write allocation for every page
-	 * (~1.5 GB/s, same cost as a CPU copy).  MAP_SHARED maps the existing
-	 * file pages directly (zero data movement) — MADV_POPULATE_READ is then
-	 * near-instant on warm storage (tmpfs/page-cache).  cuda-checkpoint only
-	 * reads these pages (copies to VRAM), so shared visibility is safe.
-	 *
-	 * File offsets and VMA addresses are always page-aligned (kernel VMAs),
-	 * and GPU_PAGES_DATA_OFFSET=4096 is one page — mmap offset constraint
-	 * (must be page-aligned) is always satisfied.
+	 * For each GPU VMA: inject pread64 in GPU_IO_CHUNK_SIZE chunks directly
+	 * into the target's anonymous VMA pages.  O_DIRECT causes the NVMe
+	 * controller to DMA straight into those pages (after the kernel faults
+	 * them in via get_user_pages), bypassing the page cache entirely.
+	 * mlock follows to pin the now-populated pages for cuda-checkpoint DMA.
 	 */
+	t0 = now_ms();
 	file_offset = GPU_PAGES_DATA_OFFSET;
 	for (i = 0; i < hdr.num_regions; i++) {
-		long mapped = inject_syscall(tid, syscall_addr, SYS_mmap,
-					     (long)regions[i].start,
-					     (long)regions[i].size,
-					     PROT_READ,
-					     MAP_FIXED | MAP_SHARED,
-					     target_fd,
-					     (long)file_offset);
-		if (mapped != (long)regions[i].start) {
-			pr_err("mmap injection failed for region %u: got 0x%lx, expected 0x%llx\n",
-			       i, mapped, (unsigned long long)regions[i].start);
-			inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
-			goto out;
+		uint64_t region_done = 0;
+
+		while (region_done < regions[i].size) {
+			uint64_t chunk = regions[i].size - region_done;
+			long n;
+
+			if (chunk > GPU_IO_CHUNK_SIZE)
+				chunk = GPU_IO_CHUNK_SIZE;
+
+			n = inject_syscall(tid, syscall_addr, SYS_pread64,
+					   target_fd,
+					   (long)(regions[i].start + region_done),
+					   (long)chunk,
+					   (long)(file_offset + region_done),
+					   0, 0);
+			if (n <= 0) {
+				pr_err("pread64 injection failed for region %u at offset %llu: %ld\n",
+				       i, (unsigned long long)region_done, n);
+				inject_syscall(tid, syscall_addr, SYS_close,
+					       target_fd, 0, 0, 0, 0, 0);
+				goto out;
+			}
+			region_done  += (uint64_t)n;
+			total_bytes  += (uint64_t)n;
 		}
 
-		/*
-		 * MADV_POPULATE_READ faults all pages in synchronously from the
-		 * file — no RLIMIT_MEMLOCK needed.  Pages are in RAM after this.
-		 * mlock follows as best-effort to pin them for DMA (may fail if
-		 * RLIMIT_MEMLOCK is too small; pages are still warm in RAM).
-		 */
-		inject_syscall(tid, syscall_addr, SYS_madvise,
-			       (long)regions[i].start, (long)regions[i].size,
-			       MADV_POPULATE_READ, 0, 0, 0);
 		inject_syscall(tid, syscall_addr, SYS_mlock,
 			       (long)regions[i].start, (long)regions[i].size,
 			       0, 0, 0, 0);
@@ -583,8 +605,15 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 		file_offset += regions[i].size;
 	}
 
+	{
+		double ms = now_ms() - t0;
+
+		pr_info("[timing] O_DIRECT pread restore: %.0f ms (%.1f GB/s)\n",
+			ms, (double)total_bytes / ms / 1e6);
+	}
+
 	inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
-	pr_info("Loaded %u GPU regions for pid %d via file-backed mmap + mlock\n",
+	pr_info("Loaded %u GPU regions for pid %d via O_DIRECT pread + mlock\n",
 		hdr.num_regions, pid);
 	ret = 0;
 out:
