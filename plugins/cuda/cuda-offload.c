@@ -100,7 +100,7 @@ static int collect_pids(int root_pid, int **out_pids, int *out_n)
 			continue; /* process may have exited */
 
 		while ((tid_ent = readdir(task_dir)) != NULL) {
-			char children_path[128];
+			char children_path[320];
 			FILE *f;
 			int child_pid;
 
@@ -186,7 +186,7 @@ static int write_pid_list(int img_dir_fd, int *pids, int n)
 
 /*
  * Read the checkpoint pid list saved by write_pid_list.
- * Returns 0 and sets *out_pids/*out_n on success; *out_n == 0 if file absent.
+ * Returns 0 and sets *out_pids / *out_n on success; *out_n == 0 if file absent.
  * Caller must free(*out_pids).
  */
 static int read_pid_list(int img_dir_fd, int **out_pids, int *out_n)
