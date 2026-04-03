@@ -38,10 +38,6 @@
 #define MADV_POPULATE_READ 22
 #endif
 
-#ifndef O_DIRECT
-#define O_DIRECT 040000 /* Linux x86-64 */
-#endif
-
 #define pr_info(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: " fmt, ##__VA_ARGS__)
 #define pr_warn(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: WARNING: " fmt, ##__VA_ARGS__)
 #define pr_err(fmt, ...)    fprintf(stderr, "cuda_gpu_pages: ERROR: " fmt, ##__VA_ARGS__)
