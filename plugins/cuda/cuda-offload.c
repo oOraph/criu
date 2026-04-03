@@ -24,6 +24,20 @@
  *
  * By default the tool recurses into the full process subtree rooted at PID.
  * Pass --no-recurse to operate on PID only.
+ *
+ * Reliability note (multi-process trees + criu restore):
+ *   When criu cannot preserve PIDs, restore uses a BFS positional mapping:
+ *   gpu-offload-pids.img records the checkpoint BFS order, and the live tree
+ *   is traversed in the same order so ckpt_pids[i] -> live_pids[i].
+ *   This mapping is only valid if the process tree is structurally identical
+ *   at the time cuda-offload restore runs.  Non-GPU children are not locked
+ *   by cuda-checkpoint and may exit freely after criu restore, breaking the
+ *   correspondence.
+ *   To guarantee a stable tree, restore the process into a frozen cgroup v2
+ *   (echo 1 > cgroup.freeze) before running criu restore.  Any process
+ *   created inside a frozen cgroup is immediately frozen by the kernel, so
+ *   the entire tree stays suspended until cuda-offload restore completes and
+ *   the orchestrator unfreezes the cgroup.
  */
 
 #include <dirent.h>
