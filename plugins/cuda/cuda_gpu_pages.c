@@ -563,16 +563,23 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	}
 
 	/*
-	 * For each GPU VMA: inject pread64 in GPU_IO_CHUNK_SIZE chunks directly
-	 * into the target's anonymous VMA pages.  O_DIRECT causes the NVMe
-	 * controller to DMA straight into those pages (after the kernel faults
-	 * them in via get_user_pages), bypassing the page cache entirely.
-	 * mlock follows to pin the now-populated pages for cuda-checkpoint DMA.
+	 * For each GPU VMA: mlock first to pre-fault all anonymous pages
+	 * (zero-fills them and pins them in RAM), then inject O_DIRECT pread64
+	 * in chunks.  Pre-faulting is the key: without it, get_user_pages()
+	 * inside the O_DIRECT path allocates and zero-fills pages on every DMA
+	 * setup, limiting throughput to ~1.5 GB/s.  With pages already present
+	 * and pinned, get_user_pages() is near-free and the NVMe controller can
+	 * DMA at full sequential read bandwidth (~2.5 GB/s on this instance).
 	 */
 	t0 = now_ms();
 	file_offset = GPU_PAGES_DATA_OFFSET;
 	for (i = 0; i < hdr.num_regions; i++) {
 		uint64_t region_done = 0;
+
+		/* Pre-fault + pin pages before the O_DIRECT read */
+		inject_syscall(tid, syscall_addr, SYS_mlock,
+			       (long)regions[i].start, (long)regions[i].size,
+			       0, 0, 0, 0);
 
 		while (region_done < regions[i].size) {
 			uint64_t chunk = regions[i].size - region_done;
@@ -597,10 +604,6 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 			region_done  += (uint64_t)n;
 			total_bytes  += (uint64_t)n;
 		}
-
-		inject_syscall(tid, syscall_addr, SYS_mlock,
-			       (long)regions[i].start, (long)regions[i].size,
-			       0, 0, 0, 0);
 
 		file_offset += regions[i].size;
 	}
