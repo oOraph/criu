@@ -58,14 +58,6 @@
 #define MAP_HUGETLB 0x40000
 #endif
 
-#ifndef SYS_sync_file_range
-#define SYS_sync_file_range 277
-#endif
-
-#ifndef SYNC_FILE_RANGE_WRITE
-#define SYNC_FILE_RANGE_WRITE 2
-#endif
-
 #define pr_info(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: " fmt, ##__VA_ARGS__)
 #define pr_warn(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: WARNING: " fmt, ##__VA_ARGS__)
 #define pr_err(fmt, ...)    fprintf(stderr, "cuda_gpu_pages: ERROR: " fmt, ##__VA_ARGS__)
@@ -204,42 +196,43 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	int fd, ret = -1, i;
 	struct gpu_pages_hdr hdr;
 	char *buf = NULL;
-	double t_readv, t_write, t_sync;
+	double t0, t_readv = 0, t_write = 0;
 
 	hdr.magic = GPU_PAGES_MAGIC;
 	hdr.num_regions = (uint32_t)count;
 
 	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", pid);
-	fd = openat(img_dir_fd, fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	/*
+	 * O_DIRECT bypasses the page cache: no dirty pages accumulate, so
+	 * restore's O_DIRECT pread finds nothing to invalidate and runs at
+	 * full NVMe bandwidth.  Without this, 6 GB of dirty pages require
+	 * sync_file_range (blocks 4 s walking 1.5M page entries) before
+	 * restore can read fast.  Header + regions are packed into one
+	 * 4096-byte aligned block to meet O_DIRECT alignment requirements.
+	 */
+	fd = openat(img_dir_fd, fname,
+		    O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0600);
 	if (fd < 0) {
 		pr_perror("Cannot create %s", fname);
 		return -1;
 	}
 
-	if (write(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
-		pr_perror("Cannot write header to %s", fname);
+	if (posix_memalign((void **)&buf, 4096, GPU_IO_CHUNK_SIZE) != 0) {
+		pr_err("OOM: cannot allocate aligned IO buffer\n");
 		goto out;
 	}
 
-	if (count > 0 && write(fd, regions, (size_t)count * sizeof(*regions)) !=
-				    (ssize_t)((size_t)count * sizeof(*regions))) {
-		pr_perror("Cannot write region table to %s", fname);
+	/* Pack header + region table into one 4096-byte O_DIRECT write */
+	memset(buf, 0, GPU_PAGES_DATA_OFFSET);
+	memcpy(buf, &hdr, sizeof(hdr));
+	if (count > 0)
+		memcpy(buf + sizeof(hdr), regions, (size_t)count * sizeof(*regions));
+	if (write(fd, buf, GPU_PAGES_DATA_OFFSET) != (ssize_t)GPU_PAGES_DATA_OFFSET) {
+		pr_perror("Cannot write header block to %s", fname);
 		goto out;
 	}
 
-	/* Seek to page-aligned offset so page data can be mmap'd directly */
-	if (lseek(fd, GPU_PAGES_DATA_OFFSET, SEEK_SET) != GPU_PAGES_DATA_OFFSET) {
-		pr_perror("lseek to data offset failed");
-		goto out;
-	}
-
-	buf = malloc(GPU_IO_CHUNK_SIZE);
-	if (!buf) {
-		pr_err("OOM: cannot allocate IO buffer\n");
-		goto out;
-	}
-
-	t_readv = 0; t_write = 0;
+	t0 = now_ms();
 	for (i = 0; i < count; i++) {
 		uint64_t offset = 0;
 		uint64_t remaining = regions[i].size;
@@ -277,22 +270,9 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 		}
 	}
 
+	pr_info("[timing] dump: process_vm_readv=%.0f ms O_DIRECT_write=%.0f ms total=%.0f ms\n",
+		t_readv, t_write, now_ms() - t0 + t_readv);
 	ret = 0;
-	/*
-	 * Start async writeback of the image file so the NVMe write is in
-	 * flight while the rest of the dump proceeds.  sync_file_range(WRITE)
-	 * submits writeback I/O and returns immediately — unlike
-	 * posix_fadvise(DONTNEED) which also calls invalidate_mapping_pages()
-	 * and scans 1.5M pages even for dirty ones, adding ~4s of overhead.
-	 * By the time restore calls O_DIRECT pread, the write is likely done
-	 * and the page cache can be evicted cheaply.
-	 */
-	t_sync = now_ms();
-	syscall(SYS_sync_file_range, fd, (int64_t)GPU_PAGES_DATA_OFFSET, (int64_t)0,
-		SYNC_FILE_RANGE_WRITE);
-	t_sync = now_ms() - t_sync;
-	pr_info("[timing] dump: process_vm_readv=%.0f ms write=%.0f ms sync_file_range=%.0f ms\n",
-		t_readv, t_write, t_sync);
 	pr_info("Dumped %d GPU regions for pid %d\n", count, pid);
 out:
 	free(buf);
@@ -560,27 +540,6 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	}
 	snprintf(file_path, sizeof(file_path), "%s/%s", img_dir_path, fname);
 	pr_info("GPU pages file: %s\n", file_path);
-
-	/*
-	 * Evict the image file's page cache before O_DIRECT pread.
-	 * dump_gpu_pages() called sync_file_range(WRITE) to start async NVMe
-	 * writeback; by now the write is likely done so pages are clean.
-	 * fadvise(DONTNEED) on clean pages is fast (~300ms for 6 GB) vs ~4s
-	 * on dirty ones.  Without this, O_DIRECT calls
-	 * invalidate_inode_pages2_range() per 64 MB chunk and waits for any
-	 * remaining dirty pages, serialising read and write I/O.
-	 */
-	{
-		int fadvise_fd = open(file_path, O_RDONLY);
-		double t_fadvise = now_ms();
-
-		if (fadvise_fd >= 0) {
-			posix_fadvise(fadvise_fd, GPU_PAGES_DATA_OFFSET, 0,
-				      POSIX_FADV_DONTNEED);
-			close(fadvise_fd);
-		}
-		pr_info("[timing] pre-pread fadvise: %.0f ms\n", now_ms() - t_fadvise);
-	}
 
 	/* Write path into target's stack (below the 128-byte x86-64 ABI red zone) */
 	{
