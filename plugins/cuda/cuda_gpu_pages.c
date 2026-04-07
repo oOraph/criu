@@ -204,7 +204,7 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	int fd, ret = -1, i;
 	struct gpu_pages_hdr hdr;
 	char *buf = NULL;
-	double t_open, t_readv, t_write, t_sync;
+	double t_readv, t_write, t_sync;
 
 	hdr.magic = GPU_PAGES_MAGIC;
 	hdr.num_regions = (uint32_t)count;
