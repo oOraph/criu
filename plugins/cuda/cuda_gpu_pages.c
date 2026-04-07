@@ -280,7 +280,7 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	 * By the time restore calls O_DIRECT pread, the write is likely done
 	 * and the page cache can be evicted cheaply.
 	 */
-	syscall(SYS_sync_file_range, fd, (off64_t)GPU_PAGES_DATA_OFFSET, (off64_t)0,
+	syscall(SYS_sync_file_range, fd, (int64_t)GPU_PAGES_DATA_OFFSET, (int64_t)0,
 		SYNC_FILE_RANGE_WRITE);
 	pr_info("Dumped %d GPU regions for pid %d\n", count, pid);
 out:
