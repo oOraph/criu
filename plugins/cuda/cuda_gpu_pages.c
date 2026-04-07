@@ -511,8 +511,7 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 		pr_perror("Cannot read region table");
 		goto out;
 	}
-	close(img_fd);
-	img_fd = -1;
+	/* Keep img_fd open — we need it for fdatasync+fadvise before the pread loop */
 
 	/*
 	 * Resolve the image file's absolute path so the target process can
@@ -583,6 +582,35 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	 * and pinned, get_user_pages() is near-free and the NVMe controller can
 	 * DMA at full sequential read bandwidth (~2.5 GB/s on this instance).
 	 */
+	/*
+	 * Evict page-cache pages for the image file before the O_DIRECT pread
+	 * loop.  O_DIRECT calls invalidate_inode_pages2_range() per chunk: with
+	 * 6 GB cached, that is ~1.6M page-cache releases spread across ~100
+	 * 64 MB chunks, cutting throughput from 3 GB/s to 1.5 GB/s.
+	 *
+	 * fdatasync first: ensures all dirty pages (from the dump write) are
+	 * flushed to NVMe before we drop them, avoiding write/read contention.
+	 * fadvise(DONTNEED) then drops the now-clean pages in one shot so the
+	 * O_DIRECT reads find an empty cache and can DMA at full NVMe bandwidth.
+	 */
+	{
+		double t_sync, t_fadv;
+		double sync_ms, fadv_ms;
+
+		t_sync = now_ms();
+		fdatasync(img_fd);
+		sync_ms = now_ms() - t_sync;
+
+		t_fadv = now_ms();
+		posix_fadvise(img_fd, GPU_PAGES_DATA_OFFSET, 0, POSIX_FADV_DONTNEED);
+		fadv_ms = now_ms() - t_fadv;
+
+		pr_info("[timing] pre-pread fdatasync=%.0f ms fadvise=%.0f ms\n",
+			sync_ms, fadv_ms);
+	}
+	close(img_fd);
+	img_fd = -1;
+
 	t0 = now_ms();
 	file_offset = GPU_PAGES_DATA_OFFSET;
 	{
