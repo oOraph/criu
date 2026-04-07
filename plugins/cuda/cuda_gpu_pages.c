@@ -585,81 +585,86 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	 */
 	t0 = now_ms();
 	file_offset = GPU_PAGES_DATA_OFFSET;
-	for (i = 0; i < hdr.num_regions; i++) {
-		uint64_t region_done = 0;
-
-		/*
-		 * Replace the VMA with MAP_HUGETLB to get guaranteed 2MB pages.
-		 * Unlike MADV_HUGEPAGE (THP), MAP_HUGETLB allocates from the
-		 * pre-reserved huge page pool and never falls back to 4KB pages.
-		 * If it fails (pool empty or address/size not 2MB-aligned), re-
-		 * create the VMA normally and fall back to MADV_HUGEPAGE.
-		 */
-		{
-			long r = inject_syscall(tid, syscall_addr, SYS_mmap,
-						(long)regions[i].start,
-						(long)regions[i].size,
-						PROT_READ | PROT_WRITE,
-						MAP_PRIVATE | MAP_ANONYMOUS |
-						MAP_FIXED | MAP_HUGETLB,
-						-1L, 0L);
-
-			if (r != (long)regions[i].start) {
-				/* MAP_HUGETLB failed — restore VMA and use THP */
-				if (i == 0)
-					pr_info("MAP_HUGETLB failed (ret=%ld), using MADV_HUGEPAGE\n", r);
-				inject_syscall(tid, syscall_addr, SYS_mmap,
-					       (long)regions[i].start,
-					       (long)regions[i].size,
-					       PROT_READ | PROT_WRITE,
-					       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-					       -1L, 0L);
-				inject_syscall(tid, syscall_addr, SYS_madvise,
-					       (long)regions[i].start,
-					       (long)regions[i].size,
-					       MADV_HUGEPAGE, 0, 0, 0);
-			} else if (i == 0) {
-				pr_info("MAP_HUGETLB succeeded\n");
-			}
-		}
-
-		/* Pre-fault + pin pages before the O_DIRECT read */
-		inject_syscall(tid, syscall_addr, SYS_mlock,
-			       (long)regions[i].start, (long)regions[i].size,
-			       0, 0, 0, 0);
-
-		while (region_done < regions[i].size) {
-			uint64_t chunk = regions[i].size - region_done;
-			long n;
-
-			if (chunk > GPU_IO_CHUNK_SIZE)
-				chunk = GPU_IO_CHUNK_SIZE;
-
-			n = inject_syscall(tid, syscall_addr, SYS_pread64,
-					   target_fd,
-					   (long)(regions[i].start + region_done),
-					   (long)chunk,
-					   (long)(file_offset + region_done),
-					   0, 0);
-			if (n <= 0) {
-				pr_err("pread64 injection failed for region %u at offset %llu: %ld\n",
-				       i, (unsigned long long)region_done, n);
-				inject_syscall(tid, syscall_addr, SYS_close,
-					       target_fd, 0, 0, 0, 0, 0);
-				goto out;
-			}
-			region_done  += (uint64_t)n;
-			total_bytes  += (uint64_t)n;
-		}
-
-		file_offset += regions[i].size;
-	}
-
 	{
-		double ms = now_ms() - t0;
+		double mlock_ms = 0, pread_ms = 0;
+		double t1;
 
-		pr_info("[timing] O_DIRECT pread restore: %.0f ms (%.1f GB/s)\n",
-			ms, (double)total_bytes / ms / 1e6);
+		for (i = 0; i < hdr.num_regions; i++) {
+			uint64_t region_done = 0;
+
+			/*
+			 * Replace the VMA with MAP_HUGETLB to get guaranteed 2MB pages.
+			 * Unlike MADV_HUGEPAGE (THP), MAP_HUGETLB allocates from the
+			 * pre-reserved huge page pool and never falls back to 4KB pages.
+			 * If it fails (pool empty or address/size not 2MB-aligned), re-
+			 * create the VMA normally and fall back to MADV_HUGEPAGE.
+			 */
+			{
+				long r = inject_syscall(tid, syscall_addr, SYS_mmap,
+							(long)regions[i].start,
+							(long)regions[i].size,
+							PROT_READ | PROT_WRITE,
+							MAP_PRIVATE | MAP_ANONYMOUS |
+							MAP_FIXED | MAP_HUGETLB,
+							-1L, 0L);
+
+				if (r != (long)regions[i].start) {
+					inject_syscall(tid, syscall_addr, SYS_mmap,
+						       (long)regions[i].start,
+						       (long)regions[i].size,
+						       PROT_READ | PROT_WRITE,
+						       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+						       -1L, 0L);
+					inject_syscall(tid, syscall_addr, SYS_madvise,
+						       (long)regions[i].start,
+						       (long)regions[i].size,
+						       MADV_HUGEPAGE, 0, 0, 0);
+				}
+			}
+
+			/* Pre-fault + pin pages before the O_DIRECT read */
+			t1 = now_ms();
+			inject_syscall(tid, syscall_addr, SYS_mlock,
+				       (long)regions[i].start, (long)regions[i].size,
+				       0, 0, 0, 0);
+			mlock_ms += now_ms() - t1;
+
+			t1 = now_ms();
+			while (region_done < regions[i].size) {
+				uint64_t chunk = regions[i].size - region_done;
+				long n;
+
+				if (chunk > GPU_IO_CHUNK_SIZE)
+					chunk = GPU_IO_CHUNK_SIZE;
+
+				n = inject_syscall(tid, syscall_addr, SYS_pread64,
+						   target_fd,
+						   (long)(regions[i].start + region_done),
+						   (long)chunk,
+						   (long)(file_offset + region_done),
+						   0, 0);
+				if (n <= 0) {
+					pr_err("pread64 injection failed for region %u at offset %llu: %ld\n",
+					       i, (unsigned long long)region_done, n);
+					inject_syscall(tid, syscall_addr, SYS_close,
+						       target_fd, 0, 0, 0, 0, 0);
+					goto out;
+				}
+				region_done  += (uint64_t)n;
+				total_bytes  += (uint64_t)n;
+			}
+			pread_ms += now_ms() - t1;
+
+			file_offset += regions[i].size;
+		}
+
+		{
+			double total_ms = now_ms() - t0;
+
+			pr_info("[timing] O_DIRECT pread restore: %.0f ms (%.1f GB/s) [mlock=%.0f ms pread=%.0f ms]\n",
+				total_ms, (double)total_bytes / total_ms / 1e6,
+				mlock_ms, pread_ms);
+		}
 	}
 
 	inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
