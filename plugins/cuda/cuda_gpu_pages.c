@@ -34,6 +34,10 @@
 #define SYS_mlock 149
 #endif
 
+#ifndef SYS_mmap
+#define SYS_mmap 9
+#endif
+
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ 22
 #endif
@@ -48,6 +52,10 @@
 
 #ifndef MADV_HUGEPAGE
 #define MADV_HUGEPAGE 14
+#endif
+
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
 #endif
 
 #define pr_info(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: " fmt, ##__VA_ARGS__)
@@ -581,14 +589,35 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 		uint64_t region_done = 0;
 
 		/*
-		 * Ask the kernel to use 2MB transparent huge pages for this
-		 * VMA.  With 2MB pages the NVMe scatter-gather list has ~3200
-		 * entries instead of ~1.6M for 4KB pages, allowing the NVMe
-		 * controller to DMA at full sequential bandwidth.
+		 * Replace the VMA with MAP_HUGETLB to get guaranteed 2MB pages.
+		 * Unlike MADV_HUGEPAGE (THP), MAP_HUGETLB allocates from the
+		 * pre-reserved huge page pool and never falls back to 4KB pages.
+		 * If it fails (pool empty or address/size not 2MB-aligned), re-
+		 * create the VMA normally and fall back to MADV_HUGEPAGE.
 		 */
-		inject_syscall(tid, syscall_addr, SYS_madvise,
-			       (long)regions[i].start, (long)regions[i].size,
-			       MADV_HUGEPAGE, 0, 0, 0);
+		{
+			long r = inject_syscall(tid, syscall_addr, SYS_mmap,
+						(long)regions[i].start,
+						(long)regions[i].size,
+						PROT_READ | PROT_WRITE,
+						MAP_PRIVATE | MAP_ANONYMOUS |
+						MAP_FIXED | MAP_HUGETLB,
+						-1L, 0L);
+
+			if (r != (long)regions[i].start) {
+				/* MAP_HUGETLB failed — restore VMA and use THP */
+				inject_syscall(tid, syscall_addr, SYS_mmap,
+					       (long)regions[i].start,
+					       (long)regions[i].size,
+					       PROT_READ | PROT_WRITE,
+					       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+					       -1L, 0L);
+				inject_syscall(tid, syscall_addr, SYS_madvise,
+					       (long)regions[i].start,
+					       (long)regions[i].size,
+					       MADV_HUGEPAGE, 0, 0, 0);
+			}
+		}
 
 		/* Pre-fault + pin pages before the O_DIRECT read */
 		inject_syscall(tid, syscall_addr, SYS_mlock,
