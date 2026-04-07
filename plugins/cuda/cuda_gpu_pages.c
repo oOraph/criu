@@ -606,6 +606,8 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 
 			if (r != (long)regions[i].start) {
 				/* MAP_HUGETLB failed — restore VMA and use THP */
+				if (i == 0)
+					pr_info("MAP_HUGETLB failed (ret=%ld), using MADV_HUGEPAGE\n", r);
 				inject_syscall(tid, syscall_addr, SYS_mmap,
 					       (long)regions[i].start,
 					       (long)regions[i].size,
@@ -616,6 +618,8 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 					       (long)regions[i].start,
 					       (long)regions[i].size,
 					       MADV_HUGEPAGE, 0, 0, 0);
+			} else if (i == 0) {
+				pr_info("MAP_HUGETLB succeeded\n");
 			}
 		}
 
