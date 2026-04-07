@@ -264,16 +264,15 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 
 	ret = 0;
 	/*
-	 * Kick off async writeback and evict clean pages now, while the rest of
-	 * the dump proceeds.  fadvise(DONTNEED) calls filemap_flush() (starts
-	 * async NVMe write) then invalidate_mapping_pages() (drops pages that
-	 * are already clean).  By the time restore calls O_DIRECT pread, the
-	 * writeback is likely done and the page cache is empty — so O_DIRECT
-	 * finds no cached pages to invalidate and runs at full NVMe bandwidth.
-	 * This is best-effort: if restore starts before writeback completes,
-	 * O_DIRECT will wait for dirty pages internally (same as today).
+	 * Start async writeback of the image file so the NVMe write is in
+	 * flight while the rest of the dump proceeds.  sync_file_range(WRITE)
+	 * submits writeback I/O and returns immediately — unlike
+	 * posix_fadvise(DONTNEED) which also calls invalidate_mapping_pages()
+	 * and scans 1.5M pages even for dirty ones, adding ~4s of overhead.
+	 * By the time restore calls O_DIRECT pread, the write is likely done
+	 * and the page cache can be evicted cheaply.
 	 */
-	posix_fadvise(fd, GPU_PAGES_DATA_OFFSET, 0, POSIX_FADV_DONTNEED);
+	sync_file_range(fd, GPU_PAGES_DATA_OFFSET, 0, SYNC_FILE_RANGE_WRITE);
 	pr_info("Dumped %d GPU regions for pid %d\n", count, pid);
 out:
 	free(buf);
@@ -541,6 +540,27 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	}
 	snprintf(file_path, sizeof(file_path), "%s/%s", img_dir_path, fname);
 	pr_info("GPU pages file: %s\n", file_path);
+
+	/*
+	 * Evict the image file's page cache before O_DIRECT pread.
+	 * dump_gpu_pages() called sync_file_range(WRITE) to start async NVMe
+	 * writeback; by now the write is likely done so pages are clean.
+	 * fadvise(DONTNEED) on clean pages is fast (~300ms for 6 GB) vs ~4s
+	 * on dirty ones.  Without this, O_DIRECT calls
+	 * invalidate_inode_pages2_range() per 64 MB chunk and waits for any
+	 * remaining dirty pages, serialising read and write I/O.
+	 */
+	{
+		int fadvise_fd = open(file_path, O_RDONLY);
+		double t_fadvise = now_ms();
+
+		if (fadvise_fd >= 0) {
+			posix_fadvise(fadvise_fd, GPU_PAGES_DATA_OFFSET, 0,
+				      POSIX_FADV_DONTNEED);
+			close(fadvise_fd);
+		}
+		pr_info("[timing] pre-pread fadvise: %.0f ms\n", now_ms() - t_fadvise);
+	}
 
 	/* Write path into target's stack (below the 128-byte x86-64 ABI red zone) */
 	{
