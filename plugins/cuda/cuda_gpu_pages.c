@@ -58,6 +58,14 @@
 #define MAP_HUGETLB 0x40000
 #endif
 
+#ifndef SYS_sync_file_range
+#define SYS_sync_file_range 277
+#endif
+
+#ifndef SYNC_FILE_RANGE_WRITE
+#define SYNC_FILE_RANGE_WRITE 2
+#endif
+
 #define pr_info(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: " fmt, ##__VA_ARGS__)
 #define pr_warn(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: WARNING: " fmt, ##__VA_ARGS__)
 #define pr_err(fmt, ...)    fprintf(stderr, "cuda_gpu_pages: ERROR: " fmt, ##__VA_ARGS__)
@@ -272,7 +280,8 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	 * By the time restore calls O_DIRECT pread, the write is likely done
 	 * and the page cache can be evicted cheaply.
 	 */
-	sync_file_range(fd, GPU_PAGES_DATA_OFFSET, 0, SYNC_FILE_RANGE_WRITE);
+	syscall(SYS_sync_file_range, fd, (off64_t)GPU_PAGES_DATA_OFFSET, (off64_t)0,
+		SYNC_FILE_RANGE_WRITE);
 	pr_info("Dumped %d GPU regions for pid %d\n", count, pid);
 out:
 	free(buf);
