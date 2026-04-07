@@ -204,6 +204,7 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	int fd, ret = -1, i;
 	struct gpu_pages_hdr hdr;
 	char *buf = NULL;
+	double t_open, t_readv, t_write, t_sync;
 
 	hdr.magic = GPU_PAGES_MAGIC;
 	hdr.num_regions = (uint32_t)count;
@@ -238,6 +239,7 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 		goto out;
 	}
 
+	t_readv = 0; t_write = 0;
 	for (i = 0; i < count; i++) {
 		uint64_t offset = 0;
 		uint64_t remaining = regions[i].size;
@@ -248,14 +250,18 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 			struct iovec remote_iov = { .iov_base = (void *)(uintptr_t)(regions[i].start + offset),
 						    .iov_len = chunk };
 			ssize_t n, written = 0;
+			double t1;
 
+			t1 = now_ms();
 			n = (ssize_t)syscall(SYS_process_vm_readv, (pid_t)pid, &local_iov, 1UL, &remote_iov, 1UL, 0UL);
+			t_readv += now_ms() - t1;
 			if (n < 0) {
 				pr_perror("process_vm_readv failed for pid %d at 0x%lx", pid,
 					  (unsigned long)(regions[i].start + offset));
 				goto out;
 			}
 
+			t1 = now_ms();
 			while (written < n) {
 				ssize_t w = write(fd, buf + written, (size_t)(n - written));
 
@@ -265,6 +271,7 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 				}
 				written += w;
 			}
+			t_write += now_ms() - t1;
 			offset += (uint64_t)n;
 			remaining -= (uint64_t)n;
 		}
@@ -280,8 +287,12 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	 * By the time restore calls O_DIRECT pread, the write is likely done
 	 * and the page cache can be evicted cheaply.
 	 */
+	t_sync = now_ms();
 	syscall(SYS_sync_file_range, fd, (int64_t)GPU_PAGES_DATA_OFFSET, (int64_t)0,
 		SYNC_FILE_RANGE_WRITE);
+	t_sync = now_ms() - t_sync;
+	pr_info("[timing] dump: process_vm_readv=%.0f ms write=%.0f ms sync_file_range=%.0f ms\n",
+		t_readv, t_write, t_sync);
 	pr_info("Dumped %d GPU regions for pid %d\n", count, pid);
 out:
 	free(buf);
