@@ -19,7 +19,6 @@
 #include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
-#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -186,34 +185,6 @@ int diff_anon_vmas(struct gpu_region *before, int n_before,
 	return 0;
 }
 
-/* Background write thread for double-buffered dump I/O */
-struct write_job {
-	int		fd;
-	const char	*buf;
-	size_t		len;
-	int		err;		/* errno on failure */
-	double		elapsed_ms;	/* wall time of the write */
-};
-
-static void *write_thread_fn(void *arg)
-{
-	struct write_job *job = arg;
-	size_t done = 0;
-	double t0 = now_ms();
-
-	while (done < job->len) {
-		ssize_t w = write(job->fd, job->buf + done, job->len - done);
-
-		if (w < 0) {
-			job->err = errno;
-			break;
-		}
-		done += (size_t)w;
-	}
-	job->elapsed_ms = now_ms() - t0;
-	return NULL;
-}
-
 /*
  * Dump GPU memory regions to gpu-pages-<pid>.img in the image directory.
  * File format: gpu_pages_hdr | gpu_region[num_regions] | raw page data
@@ -224,11 +195,7 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	char fname[64];
 	int fd, ret = -1, i;
 	struct gpu_pages_hdr hdr;
-	char *bufs[2] = { NULL, NULL };
-	pthread_t write_tid;
-	int write_running = 0;
-	struct write_job wjob = { 0 };
-	int cur = 0;
+	char *buf = NULL;
 	double t0, t_readv = 0, t_write = 0;
 
 	hdr.magic = GPU_PAGES_MAGIC;
@@ -250,30 +217,21 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 		return -1;
 	}
 
-	if (posix_memalign((void **)&bufs[0], 4096, GPU_IO_CHUNK_SIZE) != 0 ||
-	    posix_memalign((void **)&bufs[1], 4096, GPU_IO_CHUNK_SIZE) != 0) {
-		pr_err("OOM: cannot allocate aligned IO buffers\n");
+	if (posix_memalign((void **)&buf, 4096, GPU_IO_CHUNK_SIZE) != 0) {
+		pr_err("OOM: cannot allocate aligned IO buffer\n");
 		goto out;
 	}
 
 	/* Pack header + region table into one 4096-byte O_DIRECT write */
-	memset(bufs[0], 0, GPU_PAGES_DATA_OFFSET);
-	memcpy(bufs[0], &hdr, sizeof(hdr));
+	memset(buf, 0, GPU_PAGES_DATA_OFFSET);
+	memcpy(buf, &hdr, sizeof(hdr));
 	if (count > 0)
-		memcpy(bufs[0] + sizeof(hdr), regions, (size_t)count * sizeof(*regions));
-	if (write(fd, bufs[0], GPU_PAGES_DATA_OFFSET) != (ssize_t)GPU_PAGES_DATA_OFFSET) {
+		memcpy(buf + sizeof(hdr), regions, (size_t)count * sizeof(*regions));
+	if (write(fd, buf, GPU_PAGES_DATA_OFFSET) != (ssize_t)GPU_PAGES_DATA_OFFSET) {
 		pr_perror("Cannot write header block to %s", fname);
 		goto out;
 	}
 
-	/*
-	 * Double-buffered I/O: while the NVMe DMA is writing chunk N via a
-	 * background thread, the main thread reads chunk N+1 from the target
-	 * via process_vm_readv.  Since write (~30 ms/chunk) dominates readv
-	 * (~13 ms/chunk), the readv latency is fully hidden and total dump I/O
-	 * time drops from readv+write to just write.
-	 */
-	wjob.fd = fd;
 	t0 = now_ms();
 	for (i = 0; i < count; i++) {
 		uint64_t offset = 0;
@@ -281,10 +239,10 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 
 		while (remaining > 0) {
 			size_t chunk = (remaining > GPU_IO_CHUNK_SIZE) ? GPU_IO_CHUNK_SIZE : (size_t)remaining;
-			struct iovec local_iov = { .iov_base = bufs[cur], .iov_len = chunk };
+			struct iovec local_iov = { .iov_base = buf, .iov_len = chunk };
 			struct iovec remote_iov = { .iov_base = (void *)(uintptr_t)(regions[i].start + offset),
 						    .iov_len = chunk };
-			ssize_t n;
+			ssize_t n, written = 0;
 			double t1;
 
 			t1 = now_ms();
@@ -296,40 +254,19 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 				goto out;
 			}
 
-			/* Join previous write before launching the next */
-			if (write_running) {
-				pthread_join(write_tid, NULL);
-				write_running = 0;
-				t_write += wjob.elapsed_ms;
-				if (wjob.err) {
-					errno = wjob.err;
-					pr_perror("O_DIRECT write to %s failed", fname);
+			t1 = now_ms();
+			while (written < n) {
+				ssize_t w = write(fd, buf + written, (size_t)(n - written));
+
+				if (w < 0) {
+					pr_perror("write to %s failed", fname);
 					goto out;
 				}
+				written += w;
 			}
-
-			wjob.buf = bufs[cur];
-			wjob.len = (size_t)n;
-			wjob.err = 0;
-			if (pthread_create(&write_tid, NULL, write_thread_fn, &wjob) != 0) {
-				pr_perror("pthread_create failed");
-				goto out;
-			}
-			write_running = 1;
-			cur ^= 1;
+			t_write += now_ms() - t1;
 			offset += (uint64_t)n;
 			remaining -= (uint64_t)n;
-		}
-	}
-
-	if (write_running) {
-		pthread_join(write_tid, NULL);
-		write_running = 0;
-		t_write += wjob.elapsed_ms;
-		if (wjob.err) {
-			errno = wjob.err;
-			pr_perror("O_DIRECT write to %s failed", fname);
-			goto out;
 		}
 	}
 
@@ -338,10 +275,7 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	ret = 0;
 	pr_info("Dumped %d GPU regions for pid %d\n", count, pid);
 out:
-	if (write_running)
-		pthread_join(write_tid, NULL);
-	free(bufs[0]);
-	free(bufs[1]);
+	free(buf);
 	close(fd);
 	if (ret != 0)
 		unlinkat(img_dir_fd, fname, 0);
