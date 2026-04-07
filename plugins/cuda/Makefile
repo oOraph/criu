@@ -26,11 +26,11 @@ cuda_gpu_pages.o: cuda_gpu_pages.c cuda_gpu_pages.h
 
 cuda_plugin.so: cuda_plugin.c cuda_gpu_pages.o
 	$(call msg-gen, $@)
-	$(Q) $(CC) $(PLUGIN_CFLAGS) $(shell $(COMPEL) includes) $^ -o $@ $(PLUGIN_INCLUDE) $(PLUGIN_LDFLAGS)
+	$(Q) $(CC) $(PLUGIN_CFLAGS) $(shell $(COMPEL) includes) $^ -o $@ $(PLUGIN_INCLUDE) $(PLUGIN_LDFLAGS) -lpthread
 
 cuda-offload: cuda-offload.c cuda_gpu_pages.o
 	$(call msg-gen, $@)
-	$(Q) $(CC) -Wall -Werror -g $^ -o $@
+	$(Q) $(CC) -Wall -Werror -g $^ -o $@ -lpthread
 
 clean:
 	$(call msg-clean, $@)
