@@ -271,7 +271,7 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	}
 
 	pr_info("[timing] dump: process_vm_readv=%.0f ms O_DIRECT_write=%.0f ms total=%.0f ms\n",
-		t_readv, t_write, now_ms() - t0 + t_readv);
+		t_readv, t_write, now_ms() - t0);
 	ret = 0;
 	pr_info("Dumped %d GPU regions for pid %d\n", count, pid);
 out:
