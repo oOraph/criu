@@ -478,7 +478,7 @@ int cuda_plugin_checkpoint_devices(int pid)
 			pr_info("[timing] process_vm_readv dump: %.0f ms (%.1f GB/s)\n",
 				dump_ms, total_bytes / dump_ms / 1e6);
 			t0 = now_ms();
-			if (release_gpu_pages(restore_tid, syscall_addr, new_vmas, n_new) != 0)
+			if (release_gpu_pages(pid, syscall_addr, new_vmas, n_new) != 0)
 				pr_warn("madvise(DONTNEED) injection failed for pid %d, CRIU will dump GPU pages slowly\n",
 					pid);
 			else
@@ -664,7 +664,7 @@ int cuda_plugin_resume_devices_late(int pid)
 		} else {
 			double t0 = now_ms();
 
-			if (restore_gpu_pages(pid, restore_tid, syscall_addr, img_dir_fd) != 0)
+			if (restore_gpu_pages(pid, pid, syscall_addr, img_dir_fd) != 0)
 				pr_warn("O_DIRECT pread restore failed for pid %d\n", pid);
 			else
 				pr_info("[timing] O_DIRECT pread restore: %.0f ms\n", now_ms() - t0);
