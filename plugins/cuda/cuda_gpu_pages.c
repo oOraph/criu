@@ -606,6 +606,10 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 		for (i = 0; i < hdr.num_regions; i++) {
 			uint64_t region_done = 0;
 
+			/* THP hint: use 2MB pages when mlock faults them in (safe: does not set VM_HUGETLB) */
+			inject_syscall(tid, syscall_addr, SYS_madvise,
+				       (long)regions[i].start, (long)regions[i].size,
+				       MADV_HUGEPAGE, 0, 0, 0);
 			/* Pre-fault pages so O_DIRECT DMA doesn't pay fault overhead */
 			t1 = now_ms();
 			inject_syscall(tid, syscall_addr, SYS_mlock,
