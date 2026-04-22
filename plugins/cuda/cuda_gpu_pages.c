@@ -85,6 +85,16 @@ double now_ms(void)
  * preserves the in-container PID, not the host PID), so we key the
  * gpu-pages image file on the namespace PID to get a stable filename.
  * Falls back to 'pid' if the info is unavailable.
+ *
+ * Limitation: this only works when CRIU preserves namespace PIDs, which
+ * is the normal case for same-node scale-to-zero (the PID namespace is
+ * recreated fresh each restore).  If namespace PIDs also change (e.g.
+ * live migration to another node where the namespace cannot be restored
+ * cleanly), this will still produce ENOENT.  The proper fix for that case
+ * is a BFS positional pid mapping, the same approach used in cuda-offload.c
+ * (gpu-offload-pids.img): save the BFS-ordered checkpoint pid list at dump
+ * time, then at restore time walk the live tree in the same BFS order and
+ * map ckpt_pids[i] -> live_pids[i] to find the right image file.
  */
 static int get_ns_pid(int pid)
 {
