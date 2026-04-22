@@ -12,10 +12,27 @@
 
 #include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
-#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/user.h>
 #include <sys/wait.h>
+#include <unistd.h>
+
+#ifndef SYS_memfd_create
+#define SYS_memfd_create 319
+#endif
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 1U
+#endif
+
+#include "cuda_gpu_pages.h"
 
 /* cuda-checkpoint binary should live in your PATH */
 #define CUDA_CHECKPOINT "cuda-checkpoint"
@@ -58,6 +75,8 @@ struct pid_info {
  * release them after we're done with the DUMP
  */
 static LIST_HEAD(cuda_pids);
+
+
 
 static void dealloc_pid_buffer(struct list_head *pid_buf)
 {
@@ -346,6 +365,8 @@ int cuda_plugin_checkpoint_devices(int pid)
 	k_rtsigset_t save_sigset;
 	struct pid_info *task_info;
 	bool pid_found = false;
+	struct gpu_region *vmas_before = NULL, *vmas_after = NULL, *new_vmas = NULL;
+	int n_before = 0, n_after = 0, n_new = 0;
 
 	if (plugin_disabled) {
 		return -ENOTSUP;
@@ -383,21 +404,94 @@ int cuda_plugin_checkpoint_devices(int pid)
 		return -1;
 	}
 
+	/* Pre-scan: record anonymous private VMAs before cuda-checkpoint moves VRAM */
+	if (scan_anon_private_vmas(pid, &vmas_before, &n_before) != 0)
+		pr_warn("Pre-scan failed for pid %d, fast GPU page dump disabled\n", pid);
+
 	pr_info("Checkpointing CUDA devices on pid %d restore_tid %d\n", pid, restore_tid);
 	/* We need to resume the checkpoint thread to prepare the mappings for
 	 * checkpointing
 	 */
 	if (resume_restore_thread(restore_tid, &save_sigset)) {
+		free(vmas_before);
 		return -1;
 	}
 
 	task_info->checkpointed = 1;
-	status = cuda_process_checkpoint_action(pid, ACTION_CHECKPOINT, 0, msg_buf, sizeof(msg_buf));
+	{
+		double t0 = now_ms();
+		status = cuda_process_checkpoint_action(pid, ACTION_CHECKPOINT, 0, msg_buf, sizeof(msg_buf));
+		pr_info("[timing] cuda-checkpoint checkpoint: %.0f ms\n", now_ms() - t0);
+	}
 	if (status) {
 		pr_err("CHECKPOINT_DEVICES failed with %s\n", msg_buf);
 	}
 
 	int_ret = interrupt_restore_thread(restore_tid, &save_sigset);
+
+	/* Fast GPU page dump: find new VMAs created by cuda-checkpoint, dump them
+	 * with process_vm_readv, then free with injected madvise(DONTNEED) so
+	 * CRIU's page walk sees empty pages and skips them.
+	 */
+	if (status == 0 && int_ret == 0 && vmas_before != NULL) {
+		double t0, total_bytes = 0;
+		int img_dir_fd = criu_get_image_dir();
+		uint64_t syscall_addr;
+		int i;
+
+		if (img_dir_fd < 0) {
+			pr_warn("No image dir fd, skipping fast GPU page dump\n");
+			goto done;
+		}
+
+		syscall_addr = find_syscall_addr(pid);
+		if (!syscall_addr) {
+			pr_warn("Could not find syscall insn in vdso for pid %d, skipping fast GPU page dump\n", pid);
+			goto done;
+		}
+		pr_info("Found syscall insn at 0x%llx for pid %d\n",
+			(unsigned long long)syscall_addr, pid);
+
+		t0 = now_ms();
+		if (scan_anon_private_vmas(pid, &vmas_after, &n_after) != 0) {
+			pr_warn("Post-scan failed for pid %d, skipping fast GPU page dump\n", pid);
+			goto done;
+		}
+		if (diff_anon_vmas(vmas_before, n_before, vmas_after, n_after, &new_vmas, &n_new) != 0) {
+			pr_warn("VMA diff failed for pid %d, skipping fast GPU page dump\n", pid);
+			goto done;
+		}
+		pr_info("[timing] post-scan+diff: %.0f ms, %d new VMAs\n", now_ms() - t0, n_new);
+		if (n_new == 0) {
+			pr_info("No new GPU VMAs found for pid %d\n", pid);
+			goto done;
+		}
+		for (i = 0; i < n_new; i++)
+			total_bytes += new_vmas[i].size;
+		pr_info("Found %d new GPU VMAs for pid %d (%.0f MB), dumping with process_vm_readv\n",
+			n_new, pid, total_bytes / (1024 * 1024));
+
+		t0 = now_ms();
+		if (dump_gpu_pages(pid, img_dir_fd, new_vmas, n_new) == 0) {
+			double dump_ms = now_ms() - t0;
+
+			pr_info("[timing] process_vm_readv dump: %.0f ms (%.1f GB/s)\n",
+				dump_ms, total_bytes / dump_ms / 1e6);
+			t0 = now_ms();
+			if (release_gpu_pages(pid, syscall_addr, new_vmas, n_new) != 0)
+				pr_warn("madvise(DONTNEED) injection failed for pid %d, CRIU will dump GPU pages slowly\n",
+					pid);
+			else
+				pr_info("[timing] injected madvise(DONTNEED): %.0f ms\n", now_ms() - t0);
+		} else {
+			pr_warn("Fast GPU page dump failed for pid %d, CRIU will dump GPU pages\n", pid);
+		}
+	}
+
+done:
+	free(vmas_before);
+	free(vmas_after);
+	free(new_vmas);
 	return status != 0 ? -1 : int_ret;
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES, cuda_plugin_checkpoint_devices);
@@ -530,8 +624,53 @@ interrupt:
 
 int cuda_plugin_resume_devices_late(int pid)
 {
+	int img_dir_fd;
+	int restore_tid;
+	uint64_t syscall_addr;
+
 	if (plugin_disabled) {
 		return -ENOTSUP;
+	}
+
+	img_dir_fd = criu_get_image_dir();
+	restore_tid = get_cuda_restore_tid(pid);
+
+	/* If CUDA_PLUGIN_SKIP_RESTORE is set to 1/true/yes, the orchestrator will
+	 * handle GPU restore externally (after moving the process into the GPU
+	 * cgroup). The dump was produced by cuda-offload which writes a
+	 * cuda-offload-restore marker alongside the image. Skip both
+	 * restore_gpu_pages and resume_device. Without the env var, fall through
+	 * to normal restore so plain `criu restore` still works out of the box.
+	 */
+	{
+		const char *skip = getenv("CUDA_PLUGIN_SKIP_RESTORE");
+		if (skip) {
+			char tmp[8];
+			strncpy(tmp, skip, sizeof(tmp) - 1);
+			tmp[sizeof(tmp) - 1] = '\0';
+			for (int j = 0; tmp[j]; j++)
+				tmp[j] = tolower((unsigned char)tmp[j]);
+			if (strcmp(tmp, "1") == 0 || strcmp(tmp, "true") == 0 || strcmp(tmp, "yes") == 0) {
+				pr_info("CUDA_PLUGIN_SKIP_RESTORE set, deferring restore to cuda-offload for pid %d\n", pid);
+				return 0;
+			}
+		}
+	}
+
+	if (img_dir_fd >= 0 && restore_tid != -1) {
+		syscall_addr = find_syscall_addr(pid);
+		if (!syscall_addr) {
+			pr_warn("Could not find syscall insn in vdso for pid %d\n", pid);
+		} else {
+			double t0 = now_ms();
+
+			if (restore_gpu_pages(pid, pid, syscall_addr, img_dir_fd) != 0)
+				pr_warn("O_DIRECT pread restore failed for pid %d\n", pid);
+			else
+				pr_info("[timing] O_DIRECT pread restore: %.0f ms\n", now_ms() - t0);
+		}
+	} else if (img_dir_fd < 0) {
+		pr_warn("No image dir fd during restore for pid %d\n", pid);
 	}
 
 	/* RESUME_DEVICES_LATE is used during `criu restore`.
@@ -539,7 +678,13 @@ int cuda_plugin_resume_devices_late(int pid)
 	 * to be in a "running" state after restore, even if it was
 	 * in a "locked" or "checkpointed" state during `criu dump`.
 	 */
-	return resume_device(pid, 1, CUDA_TASK_RUNNING);
+	{
+		double t0 = now_ms();
+		int r = resume_device(pid, 1, CUDA_TASK_RUNNING);
+
+		pr_info("[timing] cuda-checkpoint restore+unlock: %.0f ms\n", now_ms() - t0);
+		return r;
+	}
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, cuda_plugin_resume_devices_late)
 
