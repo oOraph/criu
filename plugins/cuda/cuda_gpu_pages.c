@@ -34,6 +34,10 @@
 #define SYS_mlock 149
 #endif
 
+#ifndef SYS_munlock
+#define SYS_munlock 150
+#endif
+
 #ifndef SYS_mmap
 #define SYS_mmap 9
 #endif
@@ -602,37 +606,17 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 		for (i = 0; i < hdr.num_regions; i++) {
 			uint64_t region_done = 0;
 
-			/*
-			 * Replace the VMA with MAP_HUGETLB to get guaranteed 2MB pages.
-			 * Unlike MADV_HUGEPAGE (THP), MAP_HUGETLB allocates from the
-			 * pre-reserved huge page pool and never falls back to 4KB pages.
-			 * If it fails (pool empty or address/size not 2MB-aligned), re-
-			 * create the VMA normally and fall back to MADV_HUGEPAGE.
-			 */
-			{
-				long r = inject_syscall(tid, syscall_addr, SYS_mmap,
-							(long)regions[i].start,
-							(long)regions[i].size,
-							PROT_READ | PROT_WRITE,
-							MAP_PRIVATE | MAP_ANONYMOUS |
-							MAP_FIXED | MAP_HUGETLB,
-							-1L, 0L);
-
-				if (r != (long)regions[i].start) {
-					inject_syscall(tid, syscall_addr, SYS_mmap,
-						       (long)regions[i].start,
-						       (long)regions[i].size,
-						       PROT_READ | PROT_WRITE,
-						       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-						       -1L, 0L);
-					inject_syscall(tid, syscall_addr, SYS_madvise,
-						       (long)regions[i].start,
-						       (long)regions[i].size,
-						       MADV_HUGEPAGE, 0, 0, 0);
-				}
-			}
-
-			/* Pre-fault + pin pages before the O_DIRECT read */
+			inject_syscall(tid, syscall_addr, SYS_mmap,
+				       (long)regions[i].start,
+				       (long)regions[i].size,
+				       PROT_READ | PROT_WRITE,
+				       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+				       -1L, 0L);
+			/* Hint THP so large pages are used where possible (safe: THP does not set VM_HUGETLB) */
+			inject_syscall(tid, syscall_addr, SYS_madvise,
+				       (long)regions[i].start, (long)regions[i].size,
+				       MADV_HUGEPAGE, 0, 0, 0);
+			/* Pre-fault pages so O_DIRECT DMA doesn't pay fault overhead */
 			t1 = now_ms();
 			inject_syscall(tid, syscall_addr, SYS_mlock,
 				       (long)regions[i].start, (long)regions[i].size,
@@ -664,6 +648,18 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 				total_bytes  += (uint64_t)n;
 			}
 			pread_ms += now_ms() - t1;
+
+			/*
+			 * Release VM_LOCKED before cuda-checkpoint restore runs.
+			 * madvise(MADV_DONTNEED) returns EINVAL on VM_LOCKED pages
+			 * (see can_madv_lru_vma()), which breaks the CUDA RM's
+			 * post-restore staging buffer cleanup and leaves the context
+			 * spinning on NV_ESC_RM_CONTROL.  Pages stay warm in RAM
+			 * (recently written) so cuda-checkpoint still reads at full speed.
+			 */
+			inject_syscall(tid, syscall_addr, SYS_munlock,
+				       (long)regions[i].start, (long)regions[i].size,
+				       0, 0, 0, 0);
 
 			file_offset += regions[i].size;
 		}
