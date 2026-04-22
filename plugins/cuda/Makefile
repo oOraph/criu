@@ -18,13 +18,17 @@ include $(__nmk_dir)msg.mk
 
 all: $(DEPS_CUDA) $(OFFLOAD_BIN)
 
-# cuda_gpu_pages.o is shared between the plugin and cuda-offload.
-# Compiled with -fPIC so it can be linked into the shared library.
+# Plugin build: uses CRIU's log.h so pr_* routes to restore.log.
+cuda_gpu_pages_plugin.o: cuda_gpu_pages.c cuda_gpu_pages.h
+	$(call msg-gen, $@)
+	$(Q) $(CC) -g -Wall -Werror -fPIC $(PLUGIN_INCLUDE) -DBUILD_FOR_CRIU_PLUGIN -c $< -o $@
+
+# Standalone build: pr_* goes to stderr (console output for cuda-offload).
 cuda_gpu_pages.o: cuda_gpu_pages.c cuda_gpu_pages.h
 	$(call msg-gen, $@)
-	$(Q) $(CC) -g -Wall -Werror -fPIC $(PLUGIN_INCLUDE) -c $< -o $@
+	$(Q) $(CC) -g -Wall -Werror -fPIC -c $< -o $@
 
-cuda_plugin.so: cuda_plugin.c cuda_gpu_pages.o
+cuda_plugin.so: cuda_plugin.c cuda_gpu_pages_plugin.o
 	$(call msg-gen, $@)
 	$(Q) $(CC) $(PLUGIN_CFLAGS) $(shell $(COMPEL) includes) $^ -o $@ $(PLUGIN_INCLUDE) $(PLUGIN_LDFLAGS)
 
@@ -34,7 +38,7 @@ cuda-offload: cuda-offload.c cuda_gpu_pages.o
 
 clean:
 	$(call msg-clean, $@)
-	$(Q) $(RM) $(PLUGIN_SOBJ) $(OFFLOAD_BIN) cuda_gpu_pages.o
+	$(Q) $(RM) $(PLUGIN_SOBJ) $(OFFLOAD_BIN) cuda_gpu_pages.o cuda_gpu_pages_plugin.o
 .PHONY: clean
 
 mrproper: clean

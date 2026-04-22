@@ -62,11 +62,15 @@
 #define MAP_HUGETLB 0x40000
 #endif
 
+#ifdef BUILD_FOR_CRIU_PLUGIN
+#include "log.h" /* routes pr_* to CRIU's log fd (restore.log) */
+#else
 #define pr_info(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: " fmt, ##__VA_ARGS__)
 #define pr_warn(fmt, ...)   fprintf(stderr, "cuda_gpu_pages: WARNING: " fmt, ##__VA_ARGS__)
 #define pr_err(fmt, ...)    fprintf(stderr, "cuda_gpu_pages: ERROR: " fmt, ##__VA_ARGS__)
 #define pr_perror(fmt, ...) fprintf(stderr, "cuda_gpu_pages: ERROR: " fmt ": %s\n", \
 				    ##__VA_ARGS__, strerror(errno))
+#endif
 
 double now_ms(void)
 {
