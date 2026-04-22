@@ -110,13 +110,12 @@ static int get_ns_pid(int pid)
 
 	while (fgets(line, sizeof(line), f)) {
 		if (strncmp(line, "NSpid:", 6) == 0) {
-			int val, last = pid;
+			int val, last = pid, consumed;
 			char *p = line + 6;
 
-			while (sscanf(p, " %d", &val) == 1) {
+			while (sscanf(p, " %d%n", &val, &consumed) == 1) {
 				last = val;
-				while (*p == ' ') p++;
-				while (*p && *p != ' ' && *p != '\n') p++;
+				p += consumed;
 			}
 			ns_pid = last;
 			break;
