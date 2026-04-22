@@ -13,9 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sched.h>
 #include <sys/mman.h>
-#include <sys/mount.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -32,12 +30,32 @@
 #define SYS_move_mount 429
 #endif
 
+#ifndef SYS_setns
+#define SYS_setns 308
+#endif
+
+#ifndef SYS_umount2
+#define SYS_umount2 166
+#endif
+
 #ifndef OPEN_TREE_CLONE
 #define OPEN_TREE_CLONE 1
 #endif
 
 #ifndef MOVE_MOUNT_F_EMPTY_PATH
 #define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#endif
+
+#ifndef CLONE_NEWNS
+#define CLONE_NEWNS 0x00020000
+#endif
+
+#ifndef AT_NO_AUTOMOUNT
+#define AT_NO_AUTOMOUNT 0x800
+#endif
+
+#ifndef MNT_DETACH
+#define MNT_DETACH 2
 #endif
 
 #ifndef SYS_process_vm_readv
@@ -583,7 +601,7 @@ static int bind_mount_in_container(int pid, const char *src, const char *dst)
 		goto out;
 	}
 
-	if (setns(container_mns_fd, CLONE_NEWNS) < 0) {
+	if (syscall(SYS_setns, container_mns_fd, CLONE_NEWNS) < 0) {
 		pr_perror("setns to container mount namespace failed");
 		goto out;
 	}
@@ -591,11 +609,11 @@ static int bind_mount_in_container(int pid, const char *src, const char *dst)
 	if (syscall(SYS_move_mount, tree_fd, "", AT_FDCWD, dst,
 		    MOVE_MOUNT_F_EMPTY_PATH) < 0) {
 		pr_perror("move_mount %s -> %s failed", src, dst);
-		setns(saved_mns_fd, CLONE_NEWNS);
+		syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS);
 		goto out;
 	}
 
-	if (setns(saved_mns_fd, CLONE_NEWNS) < 0) {
+	if (syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS) < 0) {
 		pr_perror("setns back to host mount namespace failed");
 		goto out;
 	}
@@ -626,9 +644,9 @@ static void umount_in_container(int pid, const char *dst)
 		return;
 	}
 
-	if (setns(container_mns_fd, CLONE_NEWNS) == 0) {
-		umount2(dst, MNT_DETACH);
-		setns(saved_mns_fd, CLONE_NEWNS);
+	if (syscall(SYS_setns, container_mns_fd, CLONE_NEWNS) == 0) {
+		syscall(SYS_umount2, dst, MNT_DETACH);
+		syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS);
 	}
 	close(container_mns_fd);
 	close(saved_mns_fd);
