@@ -13,7 +13,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -21,6 +23,22 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+
+#ifndef SYS_move_mount
+#define SYS_move_mount 429
+#endif
+
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 1
+#endif
+
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#endif
 
 #ifndef SYS_process_vm_readv
 #define SYS_process_vm_readv 310
@@ -507,6 +525,116 @@ int release_gpu_pages(int tid, uint64_t syscall_addr, struct gpu_region *regions
 }
 
 /*
+ * Enter pid's mount namespace, bind mount src (host absolute path) to dst
+ * (a path inside the container, e.g. /tmp/.criu-gpu-restore.img), then
+ * return to the original mount namespace.
+ *
+ * The destination file is created via /proc/<pid>/root<dst> before the
+ * setns so the bind mount has a target to attach to.
+ *
+ * This works as long as the host filesystem path 'src' is accessible from
+ * within the container's mount namespace.  For non-preserved-namespace
+ * scenarios see the BFS fallback note in get_ns_pid().
+ */
+/*
+ * Bind mount 'src' (host absolute path) to 'dst' inside the container's
+ * mount namespace, using the same open_tree + move_mount pattern that CRIU
+ * uses in do_mount_in_right_mntns() (criu/mount-v2.c).
+ *
+ * open_tree(OPEN_TREE_CLONE) captures a detached anonymous mount of 'src'
+ * while still in the host namespace — the source path does not need to be
+ * accessible from inside the container.  After setns into the container's
+ * mount namespace, move_mount attaches the detached mount at 'dst'.
+ */
+static int bind_mount_in_container(int pid, const char *src, const char *dst)
+{
+	char proc_dst[PATH_MAX];
+	char ns_path[64];
+	int tree_fd = -1, saved_mns_fd = -1, container_mns_fd = -1;
+	int fd, ret = -1;
+
+	/* Capture a detached clone of src's mount in the host namespace. */
+	tree_fd = (int)syscall(SYS_open_tree, AT_FDCWD, src,
+			       OPEN_TREE_CLONE | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW);
+	if (tree_fd < 0) {
+		pr_perror("open_tree %s failed", src);
+		return -1;
+	}
+
+	/* Create the destination file inside the container's rootfs. */
+	snprintf(proc_dst, sizeof(proc_dst), "/proc/%d/root%s", pid, dst);
+	fd = open(proc_dst, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+	if (fd < 0) {
+		pr_perror("Cannot create bind mount destination %s", proc_dst);
+		goto out;
+	}
+	close(fd);
+
+	saved_mns_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+	if (saved_mns_fd < 0) {
+		pr_perror("Cannot open /proc/self/ns/mnt");
+		goto out;
+	}
+
+	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
+	container_mns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+	if (container_mns_fd < 0) {
+		pr_perror("Cannot open container mount namespace %s", ns_path);
+		goto out;
+	}
+
+	if (setns(container_mns_fd, CLONE_NEWNS) < 0) {
+		pr_perror("setns to container mount namespace failed");
+		goto out;
+	}
+
+	if (syscall(SYS_move_mount, tree_fd, "", AT_FDCWD, dst,
+		    MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+		pr_perror("move_mount %s -> %s failed", src, dst);
+		setns(saved_mns_fd, CLONE_NEWNS);
+		goto out;
+	}
+
+	if (setns(saved_mns_fd, CLONE_NEWNS) < 0) {
+		pr_perror("setns back to host mount namespace failed");
+		goto out;
+	}
+	ret = 0;
+out:
+	if (tree_fd >= 0)
+		close(tree_fd);
+	if (saved_mns_fd >= 0)
+		close(saved_mns_fd);
+	if (container_mns_fd >= 0)
+		close(container_mns_fd);
+	return ret;
+}
+
+static void umount_in_container(int pid, const char *dst)
+{
+	char ns_path[64];
+	int saved_mns_fd, container_mns_fd;
+
+	saved_mns_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+	if (saved_mns_fd < 0)
+		return;
+
+	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
+	container_mns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+	if (container_mns_fd < 0) {
+		close(saved_mns_fd);
+		return;
+	}
+
+	if (setns(container_mns_fd, CLONE_NEWNS) == 0) {
+		umount2(dst, MNT_DETACH);
+		setns(saved_mns_fd, CLONE_NEWNS);
+	}
+	close(container_mns_fd);
+	close(saved_mns_fd);
+}
+
+/*
  * Restore GPU pages into the target process via injected O_DIRECT pread64.
  *
  * Instead of mmap(MAP_SHARED)+MADV_POPULATE_READ (which reads through the
@@ -584,9 +712,18 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	img_fd = -1;
 
 	/*
-	 * Resolve the image file's absolute path so the target process can
-	 * open it via its own openat().
+	 * Resolve the host absolute path of the image file, then bind mount it
+	 * into the container's mount namespace at a per-pid well-known path.
+	 * The target process runs in the container's mount namespace and cannot
+	 * see /var/lib/zeropod/... directly, so injecting openat with the host
+	 * path yields ENOENT.  The bind mount makes the file visible at a path
+	 * the target can open.  Use ns_pid in the name to avoid collisions when
+	 * multiple pids in the same tree are restored concurrently.
 	 */
+	char gpu_restore_tmp_path[64];
+	snprintf(gpu_restore_tmp_path, sizeof(gpu_restore_tmp_path),
+		 "/tmp/.criu-gpu-restore-%d.img", ns_pid);
+
 	snprintf(proc_link, sizeof(proc_link), "/proc/self/fd/%d", img_dir_fd);
 	{
 		ssize_t n = readlink(proc_link, img_dir_path, sizeof(img_dir_path) - 1);
@@ -598,28 +735,34 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 		img_dir_path[n] = '\0';
 	}
 	snprintf(file_path, sizeof(file_path), "%s/%s", img_dir_path, fname);
-	pr_info("GPU pages file: %s\n", file_path);
+	pr_info("GPU pages host path: %s\n", file_path);
 
-	/* Write path into target's stack (below the 128-byte x86-64 ABI red zone) */
+	if (bind_mount_in_container(pid, file_path, gpu_restore_tmp_path) < 0) {
+		pr_err("Failed to bind mount gpu-pages file into container\n");
+		goto out;
+	}
+
+	/* Write the container-side path into the target's stack. */
 	{
 		struct user_regs_struct regs;
 		struct iovec local_iov, remote_iov;
-		size_t path_len = strlen(file_path) + 1;
+		const char *inject_path = gpu_restore_tmp_path;
+		size_t path_len = strlen(inject_path) + 1;
 
 		if (ptrace(PTRACE_GETREGS, tid, NULL, &regs) < 0) {
 			pr_perror("PTRACE_GETREGS failed");
-			goto out;
+			goto out_umount;
 		}
 		path_addr = regs.rsp - 256;
 
-		local_iov.iov_base = file_path;
+		local_iov.iov_base = (void *)inject_path;
 		local_iov.iov_len = path_len;
 		remote_iov.iov_base = (void *)(uintptr_t)path_addr;
 		remote_iov.iov_len = path_len;
 		if (syscall(SYS_process_vm_writev, (pid_t)tid, &local_iov, 1UL,
 			    &remote_iov, 1UL, 0UL) != (ssize_t)path_len) {
 			pr_perror("process_vm_writev path failed");
-			goto out;
+			goto out_umount;
 		}
 
 		/*
@@ -640,7 +783,7 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 
 	if (target_fd < 0) {
 		pr_err("openat injection failed: %ld\n", target_fd);
-		goto out;
+		goto out_umount;
 	}
 
 	/*
@@ -691,7 +834,7 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 					       i, (unsigned long long)region_done, n);
 					inject_syscall(tid, syscall_addr, SYS_close,
 						       target_fd, 0, 0, 0, 0, 0);
-					goto out;
+					goto out_umount;
 				}
 				region_done  += (uint64_t)n;
 				total_bytes  += (uint64_t)n;
@@ -726,6 +869,8 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	pr_info("Loaded %u GPU regions for pid %d via O_DIRECT pread + mlock\n",
 		hdr.num_regions, pid);
 	ret = 0;
+out_umount:
+	umount_in_container(pid, gpu_restore_tmp_path);
 out:
 	free(regions);
 	if (img_fd >= 0)
