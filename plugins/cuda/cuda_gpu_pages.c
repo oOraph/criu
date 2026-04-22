@@ -80,6 +80,43 @@ double now_ms(void)
 }
 
 /*
+ * Return the innermost namespace PID for 'pid' by reading NSpid from
+ * /proc/<pid>/status.  The host PID changes on every restore cycle (CRIU
+ * preserves the in-container PID, not the host PID), so we key the
+ * gpu-pages image file on the namespace PID to get a stable filename.
+ * Falls back to 'pid' if the info is unavailable.
+ */
+static int get_ns_pid(int pid)
+{
+	char path[64];
+	FILE *f;
+	char line[256];
+	int ns_pid = pid;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return pid;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "NSpid:", 6) == 0) {
+			int val, last = pid;
+			char *p = line + 6;
+
+			while (sscanf(p, " %d", &val) == 1) {
+				last = val;
+				while (*p == ' ') p++;
+				while (*p && *p != ' ' && *p != '\n') p++;
+			}
+			ns_pid = last;
+			break;
+		}
+	}
+	fclose(f);
+	return ns_pid;
+}
+
+/*
  * Scan /proc/<pid>/maps for anonymous private rw- VMAs.
  * Anonymous = dev 0:0, ino 0, no filename.
  */
@@ -206,10 +243,13 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	char *buf = NULL;
 	double t0, t_readv = 0, t_write = 0;
 
+	int ns_pid = get_ns_pid(pid);
+
 	hdr.magic = GPU_PAGES_MAGIC;
 	hdr.num_regions = (uint32_t)count;
 
-	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", pid);
+	pr_info("dump_gpu_pages: host_pid=%d ns_pid=%d\n", pid, ns_pid);
+	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", ns_pid);
 	/*
 	 * O_DIRECT bypasses the page cache: no dirty pages accumulate, so
 	 * restore's O_DIRECT pread finds nothing to invalidate and runs at
@@ -496,12 +536,14 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	long target_fd;
 	uint64_t path_addr;
 	double t0;
+	int ns_pid = get_ns_pid(pid);
 
-	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", pid);
+	pr_info("restore_gpu_pages: host_pid=%d ns_pid=%d\n", pid, ns_pid);
+	snprintf(fname, sizeof(fname), "gpu-pages-%d.img", ns_pid);
 	img_fd = openat(img_dir_fd, fname, O_RDONLY);
 	if (img_fd < 0) {
 		if (errno == ENOENT) {
-			pr_info("No gpu-pages file for pid %d, skipping\n", pid);
+			pr_info("No gpu-pages file for pid %d (ns_pid=%d), skipping\n", pid, ns_pid);
 			return 0;
 		}
 		pr_perror("Cannot open %s", fname);
