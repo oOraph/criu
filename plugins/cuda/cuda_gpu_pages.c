@@ -90,6 +90,10 @@
 #define O_DIRECT 040000 /* Linux x86-64 */
 #endif
 
+#ifndef O_PATH
+#define O_PATH 010000000 /* Linux x86-64 */
+#endif
+
 #ifndef MADV_HUGEPAGE
 #define MADV_HUGEPAGE 14
 #endif
@@ -568,7 +572,7 @@ static int bind_mount_in_container(int pid, const char *src, const char *dst)
 {
 	char proc_dst[PATH_MAX];
 	char ns_path[64];
-	int tree_fd = -1, saved_mns_fd = -1, container_mns_fd = -1;
+	int tree_fd = -1, saved_mns_fd = -1, container_mns_fd = -1, cwd_fd = -1;
 	int fd, ret = -1;
 
 	/* Capture a detached clone of src's mount in the host namespace. */
@@ -594,6 +598,18 @@ static int bind_mount_in_container(int pid, const char *src, const char *dst)
 		goto out;
 	}
 
+	/*
+	 * Save CWD before entering the container namespace.  The container's
+	 * mnt ns may not contain the host work directory, leaving the CWD
+	 * detached after setns; fchdir restores it on the way back so that
+	 * CRIU's relative paths (e.g. .criu.cgyard.*) remain resolvable.
+	 */
+	cwd_fd = open(".", O_PATH | O_DIRECTORY);
+	if (cwd_fd < 0) {
+		pr_perror("Cannot open current directory");
+		goto out;
+	}
+
 	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
 	container_mns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
 	if (container_mns_fd < 0) {
@@ -607,17 +623,18 @@ static int bind_mount_in_container(int pid, const char *src, const char *dst)
 	}
 
 	if (syscall(SYS_move_mount, tree_fd, "", AT_FDCWD, dst,
-		    MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+		    MOVE_MOUNT_F_EMPTY_PATH) < 0)
 		pr_perror("move_mount %s -> %s failed", src, dst);
-		syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS);
-		goto out;
-	}
+	else
+		ret = 0;
 
 	if (syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS) < 0) {
 		pr_perror("setns back to host mount namespace failed");
-		goto out;
+		ret = -1;
+	} else if (fchdir(cwd_fd) < 0) {
+		pr_perror("fchdir to restore working directory failed");
+		ret = -1;
 	}
-	ret = 0;
 out:
 	if (tree_fd >= 0)
 		close(tree_fd);
@@ -625,31 +642,44 @@ out:
 		close(saved_mns_fd);
 	if (container_mns_fd >= 0)
 		close(container_mns_fd);
+	if (cwd_fd >= 0)
+		close(cwd_fd);
 	return ret;
 }
 
 static void umount_in_container(int pid, const char *dst)
 {
 	char ns_path[64];
-	int saved_mns_fd, container_mns_fd;
+	int saved_mns_fd, container_mns_fd, cwd_fd;
 
 	saved_mns_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
 	if (saved_mns_fd < 0)
 		return;
 
+	cwd_fd = open(".", O_PATH | O_DIRECTORY);
+	if (cwd_fd < 0) {
+		close(saved_mns_fd);
+		return;
+	}
+
 	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
 	container_mns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
 	if (container_mns_fd < 0) {
 		close(saved_mns_fd);
+		close(cwd_fd);
 		return;
 	}
 
 	if (syscall(SYS_setns, container_mns_fd, CLONE_NEWNS) == 0) {
 		syscall(SYS_umount2, dst, MNT_DETACH);
-		syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS);
+		if (syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS) < 0)
+			pr_perror("setns back to host mount namespace failed in umount");
+		else if (fchdir(cwd_fd) < 0)
+			pr_perror("fchdir to restore working directory failed in umount");
 	}
 	close(container_mns_fd);
 	close(saved_mns_fd);
+	close(cwd_fd);
 }
 
 /*
