@@ -3,11 +3,12 @@
  *
  * --action checkpoint:
  *   1. cuda-checkpoint --action lock     (quiesce CUDA)
- *   2. cuda-checkpoint --action checkpoint (VRAM -> CPU RAM)
- *   3. ptrace-stop process
- *   4. Diff anonymous VMAs before/after, dump new ones to gpu-pages-<pid>.img
- *   5. Inject madvise(MADV_DONTNEED) to free the CPU RAM
- *   6. ptrace-detach
+ *   2. ptrace-stop process               (freeze before pre-scan, closes TOCTOU race)
+ *   3. Snapshot anonymous VMAs (before)
+ *   4. cuda-checkpoint --action checkpoint (VRAM -> CPU RAM, runs via UVM driver)
+ *   5. Diff anonymous VMAs before/after, dump new ones to gpu-pages-<pid>.img
+ *   6. Inject madvise(MADV_DONTNEED) to free the CPU RAM
+ *   7. ptrace-detach
  *   -> GPU stays frozen, data on disk, zero CPU RAM used.
  *
  * --action restore:
@@ -305,23 +306,31 @@ static int do_checkpoint_one(int pid, int img_dir_fd)
 	}
 	pr_info("[timing] pid %d lock: %.0f ms\n", pid, now_ms() - t0);
 
-	/* 2. Snapshot anonymous private VMAs before VRAM moves to RAM */
-	if (scan_anon_private_vmas(pid, &vmas_before, &n_before) != 0)
-		pr_warn("pid %d: pre-scan failed; cannot identify GPU VMAs\n", pid);
-
-	/* 3. Checkpoint: cuda-checkpoint moves VRAM into new anon VMAs */
-	t0 = now_ms();
-	if (run_cuda_checkpoint(pid, "checkpoint") != 0) {
-		free(vmas_before);
-		return -1;
-	}
-	pr_info("[timing] pid %d checkpoint: %.0f ms\n", pid, now_ms() - t0);
-
-	/* 4. Stop the process so we can inject safely */
+	/*
+	 * 2. Freeze the process now that CUDA is locked.  cuda-checkpoint
+	 *    communicates with the CUDA runtime via the UVM kernel driver, so
+	 *    checkpoint can run with CPU threads stopped.  Freezing here closes
+	 *    the TOCTOU window: any anonymous VMA created between pre-scan and
+	 *    ptrace_stop would appear as a false-positive GPU VMA and get
+	 *    MADV_DONTNEED'd, silently zeroing live application memory.
+	 */
 	if (ptrace_stop(pid) != 0) {
 		free(vmas_before);
 		return -1;
 	}
+
+	/* 3. Snapshot anonymous private VMAs before VRAM moves to RAM */
+	if (scan_anon_private_vmas(pid, &vmas_before, &n_before) != 0)
+		pr_warn("pid %d: pre-scan failed; cannot identify GPU VMAs\n", pid);
+
+	/* 4. Checkpoint: cuda-checkpoint moves VRAM into new anon VMAs */
+	t0 = now_ms();
+	if (run_cuda_checkpoint(pid, "checkpoint") != 0) {
+		ptrace_resume(pid);
+		free(vmas_before);
+		return -1;
+	}
+	pr_info("[timing] pid %d checkpoint: %.0f ms\n", pid, now_ms() - t0);
 
 	if (!vmas_before)
 		goto done;
