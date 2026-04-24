@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh:*)",
+      "Bash(/tmp/summary.txt:*)",
+      "Read(//tmp/**)",
+      "Bash(find ~/.claude -name SKILL.md -o -name *.skill)",
+      "Bash(find ~/.claude -path */skills/* -name *.md)",
+      "WebFetch(domain:developer.nvidia.com)",
+      "Bash(git -c commit.gpgsign=false add plugins/cuda/cuda_gpu_pages.c plugins/cuda/cuda_plugin.c)",
+      "Bash(git -c commit.gpgsign=false commit -m \"cuda_gpu_pages: restore via plugin-side huge-page O_DIRECT + process_vm_writev\")"
+    ]
+  }
+}
