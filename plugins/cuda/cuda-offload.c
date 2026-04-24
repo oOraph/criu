@@ -159,6 +159,42 @@ static int img_exists(int pid, int dir_fd)
 }
 
 /*
+ * Return the innermost namespace PID for 'pid' by reading NSpid from
+ * /proc/<pid>/status.  Falls back to 'pid' if the info is unavailable.
+ * gpu-pages images are keyed on the ns-pid (see dump_gpu_pages in
+ * cuda_gpu_pages.c), so we need this when restoring from the host namespace
+ * where collect_pids() returns host PIDs but the image filename uses the
+ * container-side (ns) PID.
+ */
+static int get_ns_pid_for_pid(int pid)
+{
+	char path[64];
+	FILE *f;
+	char line[256];
+	int ns_pid = pid;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return pid;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "NSpid:", 6) == 0) {
+			int val, last = pid, consumed;
+			char *p = line + 6;
+
+			while (sscanf(p, " %d%n", &val, &consumed) == 1) {
+				last = val;
+				p += consumed;
+			}
+			ns_pid = last;
+			break;
+		}
+	}
+	fclose(f);
+	return ns_pid;
+}
+
+/*
  * Write the ordered pid list to PID_LIST_FILE so restore can map checkpoint
  * pids to live pids when they differ after criu restore.
  */
@@ -545,8 +581,22 @@ int main(int argc, char **argv)
 				/* Map via saved BFS order (pids changed after criu restore). */
 				img_pid = ckpt_pids[i];
 			} else {
-				pr_info("pid %d: no image found, skipping\n", cur_pid);
-				continue;
+				/*
+				 * Images are keyed on the innermost ns-pid (see
+				 * dump_gpu_pages).  When running from the host namespace
+				 * collect_pids() returns host PIDs, which differ from the
+				 * ns-pid used to name the file.  Try the ns-pid as a
+				 * last resort before giving up.
+				 */
+				int ns_pid = get_ns_pid_for_pid(cur_pid);
+
+				if (ns_pid != cur_pid && img_exists(ns_pid, img_dir_fd)) {
+					img_pid = cur_pid;
+				} else {
+					pr_info("pid %d (ns_pid=%d): no image found, skipping\n",
+						cur_pid, ns_pid);
+					continue;
+				}
 			}
 
 			if (do_restore_one(cur_pid, img_dir_fd, img_pid) != 0) {
