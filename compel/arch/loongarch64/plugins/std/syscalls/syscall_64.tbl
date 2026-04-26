@@ -6,6 +6,7 @@
 # __NR_name			code		name			arguments
 # -------------------------------------------------------------------------------------------------------------------------------------------------------------
 __NR_io_setup			0	sys_io_setup		(unsigned nr_events, aio_context_t *ctx)
+__NR_io_destroy			1	sys_io_destroy		(aio_context_t ctx)
 __NR_io_submit			2	sys_io_submit		(aio_context_t ctx, long nr, struct iocb **iocbpp)
 __NR_io_getevents		4	sys_io_getevents	(aio_context_t ctx, long min_nr, long nr, struct io_event *evs, struct timespec *tmo)
 __NR_fcntl			25	sys_fcntl		(int fd, int type, long arg)
