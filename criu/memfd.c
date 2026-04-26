@@ -310,9 +310,6 @@ static int memfd_open_inode(struct memfd_restore_inode *inode)
 {
 	int fd;
 
-	if (inode->fdstore_id != -1)
-		return fdstore_get(inode->fdstore_id);
-
 	mutex_lock(&inode->lock);
 	if (inode->fdstore_id != -1)
 		fd = fdstore_get(inode->fdstore_id);
