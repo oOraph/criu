@@ -836,7 +836,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->seek_pagemap = seek_pagemap;
 	pr->reset = reset_pagemap;
 	pr->io_complete = NULL; /* set up by the client if needed */
-	pr->id = ids++;
+	pr->id = __sync_fetch_and_add(&ids, 1);
 	pr->img_id = img_id;
 
 	if (remote)
