@@ -2526,6 +2526,12 @@ static int open_filemap(int pid, struct vma_area *vma)
 	return 0;
 }
 
+int open_file_for_vma(struct vma_area *vma, u32 flags)
+{
+	BUG_ON((vma->vmfd == NULL) || !vma->e->has_fdflags);
+	return open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
+}
+
 int collect_filemap(struct vma_area *vma)
 {
 	struct file_desc *fd;
