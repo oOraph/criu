@@ -61,6 +61,11 @@ struct page_read {
 	/* Whether or not disable image deduplication*/
 	bool disable_dedup;
 
+	/* Whether O_DIRECT is active on the pages fd. Set once during
+	 * open_page_read_at() after probing that direct reads work; never changes after
+	 * that. Cached here to avoid a fcntl(F_GETFL) syscall per page read. */
+	bool use_direct;
+
 	/* Private data of reader */
 	struct cr_img *pmi;
 	struct cr_img *pi;
@@ -107,6 +112,20 @@ struct task_restore_args;
 
 int pagemap_enqueue_iovec(struct page_read *pr, void *buf, unsigned long len, struct list_head *to);
 int pagemap_render_iovec(struct list_head *from, struct task_restore_args *ta);
+
+/*
+ * Try to enable O_DIRECT on a pages-image fd and verify with one
+ * aligned probe read.
+ *
+ *   1 - O_DIRECT enabled
+ *   0 - O_DIRECT disabled or rejected; fd left in usable buffered
+ *       state with POSIX_FADV_SEQUENTIAL hinted
+ *  -1 - hard error; caller releases the fd
+ *
+ * PAGE_SIZE is not a compile-time constant on aarch64, so the probe
+ * buffer comes from posix_memalign().
+ */
+int probe_pages_o_direct(int fd);
 
 /*
  * Create a shallow copy of page_read object.
