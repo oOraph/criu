@@ -507,6 +507,48 @@ int cuda_plugin_pause_devices(int pid)
 		return -ENOTSUP;
 	}
 
+	/*
+	 * If cuda-offload --leave-stopped already ran, the CUDA restore thread
+	 * is stopped and cuda-checkpoint queries hang (--get-state needs the
+	 * thread to respond; the process can't).  Infer state from artifacts:
+	 * stopped-marker present + gpu-pages-<pid>.img present => this pid was
+	 * pre-checkpointed.  Register it directly and skip all IPC calls.
+	 */
+	{
+		int img_dir_fd = criu_get_image_dir();
+
+		if (img_dir_fd >= 0) {
+			int mfd = openat(img_dir_fd, STOPPED_MARKER_FILE, O_RDONLY);
+
+			if (mfd >= 0) {
+				char gpname[64];
+				int gpfd;
+
+				close(mfd);
+				snprintf(gpname, sizeof(gpname), "gpu-pages-%d.img", pid);
+				gpfd = openat(img_dir_fd, gpname, O_RDONLY);
+				if (gpfd >= 0) {
+					close(gpfd);
+					if (!plugin_added_to_inventory) {
+						if (add_inventory_plugin(CR_PLUGIN_DESC.name)) {
+							pr_err("Failed to add CUDA plugin to inventory image\n");
+							return -1;
+						}
+						plugin_added_to_inventory = true;
+					}
+					pr_info("pid %d: pre-checkpointed by cuda-offload, skipping pause\n", pid);
+					if (add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_CHECKPOINTED)) {
+						pr_err("unable to track pre-checkpointed pid %d\n", pid);
+						return -1;
+					}
+					return 0;
+				}
+				pr_info("pid %d: stopped-marker found but no GPU pages, skipping\n", pid);
+				return 0;
+			}
+		}
+	}
+
 	restore_tid = get_cuda_restore_tid(pid);
 
 	if (restore_tid == -1) {
