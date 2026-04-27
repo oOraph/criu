@@ -489,20 +489,46 @@ long inject_syscall(int tid, uint64_t syscall_addr,
 	}
 
 	/*
-	 * When TIF_SYSCALL_TRACE is active (left by compel_stop_on_syscall's
-	 * PTRACE_SYSCALL) and PTRACE_O_TRACESYSGOOD is set, PTRACE_SINGLESTEP
-	 * catches the syscall-entry stop before the syscall executes — rax
-	 * holds the syscall number, not the return value.  Advance to the
-	 * syscall-exit stop to get the real return value.
+	 * Drain unexpected stops before reading the syscall return value:
+	 *
+	 * 1. Signal-delivery stops (WSTOPSIG != SIGTRAP, 0x80 bit clear):
+	 *    A pending signal (e.g. SIGCONT queued after cancelling the
+	 *    SIGSTOP from finalize_restore) is intercepted by ptrace before
+	 *    the injected syscall executes.  rax still holds the syscall
+	 *    number we wrote, not the return value.  Suppress the signal
+	 *    (data=0) and singlestep again to reach the actual syscall.
+	 *
+	 * 2. Syscall-entry stop (WSTOPSIG == SIGTRAP|0x80, PTRACE_O_TRACESYSGOOD
+	 *    + TIF_SYSCALL_TRACE active): the injected syscall has not yet
+	 *    executed.  Advance with PTRACE_SYSCALL to the exit stop to get
+	 *    the real rax.
 	 */
-	if (WIFSTOPPED(status) && (WSTOPSIG(status) & 0x80)) {
-		if (ptrace(PTRACE_SYSCALL, tid, NULL, NULL) < 0) {
-			pr_perror("PTRACE_SYSCALL past entry stop failed for tid %d", tid);
+	while (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP) {
+		int sig = WSTOPSIG(status);
+
+		if (sig & 0x80) {
+			/* Syscall-entry stop: advance to exit for real rax */
+			if (ptrace(PTRACE_SYSCALL, tid, NULL, NULL) < 0) {
+				pr_perror("PTRACE_SYSCALL past entry stop failed for tid %d", tid);
+				ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+				return LONG_MIN;
+			}
+			if (waitpid(tid, &status, __WALL) < 0) {
+				pr_perror("waitpid at syscall exit failed for tid %d", tid);
+				ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+				return LONG_MIN;
+			}
+			break; /* now at syscall-exit stop; rax = return value */
+		}
+
+		/* Signal-delivery stop: suppress the signal and singlestep again */
+		if (ptrace(PTRACE_SINGLESTEP, tid, NULL, NULL) < 0) {
+			pr_perror("PTRACE_SINGLESTEP (signal drain) failed for tid %d", tid);
 			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
 			return LONG_MIN;
 		}
 		if (waitpid(tid, &status, __WALL) < 0) {
-			pr_perror("waitpid at syscall exit failed for tid %d", tid);
+			pr_perror("waitpid (signal drain) failed for tid %d", tid);
 			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
 			return LONG_MIN;
 		}

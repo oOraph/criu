@@ -703,12 +703,14 @@ int cuda_plugin_resume_devices_late(int pid)
 	/*
 	 * If the dump was produced by `cuda-offload --leave-stopped`, criu's
 	 * finalize_restore() has already queued a SIGSTOP on this process
-	 * (to re-enter stopped state after restore).  We must cancel that
-	 * pending SIGSTOP before resume_restore_thread calls PTRACE_CONT,
-	 * otherwise the kernel delivers SIGSTOP as a ptrace signal-delivery
-	 * stop and interrupt_restore_thread finds the thread in an unexpected
-	 * state.  SIGCONT atomically discards any pending SIGSTOP in the
-	 * kernel before we touch ptrace, and is a no-op if nothing is pending.
+	 * (to re-enter stopped state after restore).  SIGSTOP is sent to the
+	 * entire thread group, so it affects both the main thread and the CUDA
+	 * restore thread used by resume_restore_thread.  SIGCONT cancels the
+	 * pending SIGSTOP for all threads before any ptrace resumes happen.
+	 *
+	 * Note: SIGCONT itself becomes a pending signal on the ptraced process.
+	 * inject_syscall's signal-drain loop handles this by suppressing the
+	 * SIGCONT delivery stop before reading the syscall return value.
 	 */
 	if (img_dir_fd >= 0) {
 		int marker_fd = openat(img_dir_fd, STOPPED_MARKER_FILE, O_RDONLY);
