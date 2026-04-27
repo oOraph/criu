@@ -488,6 +488,26 @@ long inject_syscall(int tid, uint64_t syscall_addr,
 		return LONG_MIN;
 	}
 
+	/*
+	 * When TIF_SYSCALL_TRACE is active (left by compel_stop_on_syscall's
+	 * PTRACE_SYSCALL) and PTRACE_O_TRACESYSGOOD is set, PTRACE_SINGLESTEP
+	 * catches the syscall-entry stop before the syscall executes — rax
+	 * holds the syscall number, not the return value.  Advance to the
+	 * syscall-exit stop to get the real return value.
+	 */
+	if (WIFSTOPPED(status) && (WSTOPSIG(status) & 0x80)) {
+		if (ptrace(PTRACE_SYSCALL, tid, NULL, NULL) < 0) {
+			pr_perror("PTRACE_SYSCALL past entry stop failed for tid %d", tid);
+			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+			return LONG_MIN;
+		}
+		if (waitpid(tid, &status, __WALL) < 0) {
+			pr_perror("waitpid at syscall exit failed for tid %d", tid);
+			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+			return LONG_MIN;
+		}
+	}
+
 	if (ptrace(PTRACE_GETREGS, tid, NULL, &after_regs) < 0) {
 		pr_perror("PTRACE_GETREGS after syscall failed for tid %d", tid);
 		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
