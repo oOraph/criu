@@ -476,69 +476,69 @@ long inject_syscall(int tid, uint64_t syscall_addr,
 		return LONG_MIN;
 	}
 
-	if (ptrace(PTRACE_SINGLESTEP, tid, NULL, NULL) < 0) {
-		pr_perror("PTRACE_SINGLESTEP failed for tid %d", tid);
-		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-		return LONG_MIN;
-	}
-
-	if (waitpid(tid, &status, __WALL) < 0) {
-		pr_perror("waitpid after SINGLESTEP failed for tid %d", tid);
-		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-		return LONG_MIN;
-	}
-
 	/*
-	 * Drain unexpected stops before reading the syscall return value:
+	 * Singlestep until the injected syscall has actually executed.
 	 *
-	 * 1. Signal-delivery stops (WSTOPSIG != SIGTRAP, 0x80 bit clear):
-	 *    A pending signal (e.g. SIGCONT queued after cancelling the
-	 *    SIGSTOP from finalize_restore) is intercepted by ptrace before
-	 *    the injected syscall executes.  rax still holds the syscall
-	 *    number we wrote, not the return value.  Suppress the signal
-	 *    (data=0) and singlestep again to reach the actual syscall.
+	 * When the thread is in a syscall-exit ptrace-stop (left by
+	 * compel_stop_on_syscall), PTRACE_SINGLESTEP fires its SIGTRAP when
+	 * the kernel returns to user space via sysret — before the instruction
+	 * at the new RIP (our injected syscall) executes.  rip == syscall_addr
+	 * after that stop means the syscall hasn't run yet; loop and singlestep
+	 * again so it actually executes.
 	 *
-	 * 2. Syscall-entry stop (WSTOPSIG == SIGTRAP|0x80, PTRACE_O_TRACESYSGOOD
-	 *    + TIF_SYSCALL_TRACE active): the injected syscall has not yet
-	 *    executed.  Advance with PTRACE_SYSCALL to the exit stop to get
-	 *    the real rax.
+	 * Inside each iteration, also drain unexpected stops:
+	 *  - Signal-delivery stops (WSTOPSIG != SIGTRAP and 0x80 bit clear):
+	 *    pending signal (e.g. SIGCONT from our leave-stopped cleanup)
+	 *    intercepted before the syscall; suppress (data=0) and retry.
+	 *  - Syscall-entry stop (WSTOPSIG == SIGTRAP|0x80): TIF_SYSCALL_TRACE
+	 *    fired at entry; advance to exit with PTRACE_SYSCALL.
 	 */
-	while (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP) {
-		int sig = WSTOPSIG(status);
-
-		if (sig & 0x80) {
-			/* Syscall-entry stop: advance to exit for real rax */
-			if (ptrace(PTRACE_SYSCALL, tid, NULL, NULL) < 0) {
-				pr_perror("PTRACE_SYSCALL past entry stop failed for tid %d", tid);
-				ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-				return LONG_MIN;
-			}
-			if (waitpid(tid, &status, __WALL) < 0) {
-				pr_perror("waitpid at syscall exit failed for tid %d", tid);
-				ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-				return LONG_MIN;
-			}
-			break; /* now at syscall-exit stop; rax = return value */
-		}
-
-		/* Signal-delivery stop: suppress the signal and singlestep again */
+	do {
 		if (ptrace(PTRACE_SINGLESTEP, tid, NULL, NULL) < 0) {
-			pr_perror("PTRACE_SINGLESTEP (signal drain) failed for tid %d", tid);
+			pr_perror("PTRACE_SINGLESTEP failed for tid %d", tid);
 			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
 			return LONG_MIN;
 		}
 		if (waitpid(tid, &status, __WALL) < 0) {
-			pr_perror("waitpid (signal drain) failed for tid %d", tid);
+			pr_perror("waitpid after SINGLESTEP failed for tid %d", tid);
 			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
 			return LONG_MIN;
 		}
-	}
 
-	if (ptrace(PTRACE_GETREGS, tid, NULL, &after_regs) < 0) {
-		pr_perror("PTRACE_GETREGS after syscall failed for tid %d", tid);
-		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-		return LONG_MIN;
-	}
+		while (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP) {
+			int sig = WSTOPSIG(status);
+
+			if (sig & 0x80) {
+				if (ptrace(PTRACE_SYSCALL, tid, NULL, NULL) < 0) {
+					pr_perror("PTRACE_SYSCALL past entry stop failed for tid %d", tid);
+					ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+					return LONG_MIN;
+				}
+				if (waitpid(tid, &status, __WALL) < 0) {
+					pr_perror("waitpid at syscall exit failed for tid %d", tid);
+					ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+					return LONG_MIN;
+				}
+				break;
+			}
+			if (ptrace(PTRACE_SINGLESTEP, tid, NULL, NULL) < 0) {
+				pr_perror("PTRACE_SINGLESTEP (signal drain) failed for tid %d", tid);
+				ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+				return LONG_MIN;
+			}
+			if (waitpid(tid, &status, __WALL) < 0) {
+				pr_perror("waitpid (signal drain) failed for tid %d", tid);
+				ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+				return LONG_MIN;
+			}
+		}
+
+		if (ptrace(PTRACE_GETREGS, tid, NULL, &after_regs) < 0) {
+			pr_perror("PTRACE_GETREGS after syscall failed for tid %d", tid);
+			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+			return LONG_MIN;
+		}
+	} while (after_regs.rip == syscall_addr);
 
 	if (ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs) < 0) {
 		pr_perror("PTRACE_SETREGS restore failed for tid %d", tid);
