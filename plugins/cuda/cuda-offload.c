@@ -318,11 +318,6 @@ static void ptrace_resume(int pid)
 	ptrace(PTRACE_DETACH, pid, NULL, NULL);
 }
 
-static void ptrace_resume_stopped(int pid)
-{
-	ptrace(PTRACE_DETACH, pid, NULL, (void *)(uintptr_t)SIGSTOP);
-}
-
 /* ---- per-pid checkpoint / restore ---- */
 
 /*
@@ -330,7 +325,7 @@ static void ptrace_resume_stopped(int pid)
  * Returns 0 on success, -1 on error.  A non-zero return from cuda-checkpoint
  * itself (e.g. no CUDA context) is treated as a skip, not an error.
  */
-static int do_checkpoint_one(int pid, int img_dir_fd, int leave_stopped)
+static int do_checkpoint_one(int pid, int img_dir_fd)
 {
 	struct gpu_region *vmas_before = NULL, *vmas_after = NULL;
 	struct gpu_region *new_vmas = NULL;
@@ -424,10 +419,7 @@ static int do_checkpoint_one(int pid, int img_dir_fd, int leave_stopped)
 		pr_warn("pid %d: madvise(DONTNEED) failed; CPU RAM not freed\n", pid);
 
 done:
-	if (leave_stopped)
-		ptrace_resume_stopped(pid);
-	else
-		ptrace_resume(pid);
+	ptrace_resume(pid);
 	free(vmas_before);
 	free(vmas_after);
 	free(new_vmas);
@@ -561,15 +553,31 @@ int main(int argc, char **argv)
 			pr_warn("Failed to write pid list; restore may not work if pids change\n");
 
 		for (i = 0; i < n_pids; i++) {
-			if (do_checkpoint_one(pids[i], img_dir_fd, leave_stopped) != 0) {
+			if (do_checkpoint_one(pids[i], img_dir_fd) != 0) {
 				pr_err("Checkpoint failed for pid %d\n", pids[i]);
 				ret = 1;
 			}
 		}
 
 		if (leave_stopped) {
-			int fd = openat(img_dir_fd, STOPPED_MARKER_FILE,
-					O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			int fd;
+
+			/*
+			 * Stop the entire tree in BFS order (parent first) so the
+			 * parent cannot react to a stopped child before it is itself
+			 * stopped.  Pids without a CUDA context were never ptrace-
+			 * attached, so they must be stopped here via kill() just like
+			 * the rest.
+			 */
+			for (i = 0; i < n_pids; i++) {
+				if (kill(pids[i], SIGSTOP) < 0)
+					pr_perror("Failed to SIGSTOP pid %d", pids[i]);
+				else
+					pr_info("pid %d: stopped\n", pids[i]);
+			}
+
+			fd = openat(img_dir_fd, STOPPED_MARKER_FILE,
+				    O_WRONLY | O_CREAT | O_TRUNC, 0644);
 			if (fd < 0)
 				pr_perror("Cannot write " STOPPED_MARKER_FILE);
 			else
