@@ -36,6 +36,7 @@
 
 /* cuda-checkpoint binary should live in your PATH */
 #define CUDA_CHECKPOINT "cuda-checkpoint"
+#define STOPPED_MARKER_FILE "gpu-offload-stopped.marker"
 
 /* cuda-checkpoint --action flags */
 #define ACTION_LOCK	  "lock"
@@ -654,6 +655,26 @@ int cuda_plugin_resume_devices_late(int pid)
 				pr_info("CUDA_PLUGIN_SKIP_RESTORE set, deferring restore to cuda-offload for pid %d\n", pid);
 				return 0;
 			}
+		}
+	}
+
+	/*
+	 * If the dump was produced by `cuda-offload --leave-stopped`, criu's
+	 * finalize_restore() has already queued a SIGSTOP on this process
+	 * (to re-enter stopped state after restore).  We must cancel that
+	 * pending SIGSTOP before resume_restore_thread calls PTRACE_CONT,
+	 * otherwise the kernel delivers SIGSTOP as a ptrace signal-delivery
+	 * stop and interrupt_restore_thread finds the thread in an unexpected
+	 * state.  SIGCONT atomically discards any pending SIGSTOP in the
+	 * kernel before we touch ptrace, and is a no-op if nothing is pending.
+	 */
+	if (img_dir_fd >= 0) {
+		int marker_fd = openat(img_dir_fd, STOPPED_MARKER_FILE, O_RDONLY);
+
+		if (marker_fd >= 0) {
+			close(marker_fd);
+			pr_info("pid %d: stopped-marker found, sending SIGCONT to clear pending SIGSTOP\n", pid);
+			kill(pid, SIGCONT);
 		}
 	}
 
