@@ -1,6 +1,7 @@
 PLUGIN_NAME := cuda_plugin
 PLUGIN_SOBJ := cuda_plugin.so
 OFFLOAD_BIN := cuda-offload
+PAUSE_BIN   := cuda-pause
 
 DEPS_CUDA := $(PLUGIN_SOBJ)
 
@@ -16,7 +17,7 @@ PLUGIN_CFLAGS := -g -Wall -Werror -shared -nostartfiles -fPIC
 __nmk_dir ?= ../../scripts/nmk/scripts/
 include $(__nmk_dir)msg.mk
 
-all: $(DEPS_CUDA) $(OFFLOAD_BIN)
+all: $(DEPS_CUDA) $(OFFLOAD_BIN) $(PAUSE_BIN)
 
 # Plugin build: uses CRIU's log.h so pr_* routes to restore.log.
 cuda_gpu_pages_plugin.o: cuda_gpu_pages.c cuda_gpu_pages.h
@@ -36,9 +37,13 @@ cuda-offload: cuda-offload.c cuda_gpu_pages.o
 	$(call msg-gen, $@)
 	$(Q) $(CC) -Wall -Werror -g $^ -o $@
 
+cuda-pause: cuda-pause.c
+	$(call msg-gen, $@)
+	$(Q) $(CC) -Wall -Werror -g $< -o $@
+
 clean:
 	$(call msg-clean, $@)
-	$(Q) $(RM) $(PLUGIN_SOBJ) $(OFFLOAD_BIN) cuda_gpu_pages.o cuda_gpu_pages_plugin.o
+	$(Q) $(RM) $(PLUGIN_SOBJ) $(OFFLOAD_BIN) $(PAUSE_BIN) cuda_gpu_pages.o cuda_gpu_pages_plugin.o
 .PHONY: clean
 
 mrproper: clean
