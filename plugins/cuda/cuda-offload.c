@@ -20,7 +20,7 @@
  *   6. cuda-checkpoint --action unlock
  *
  * Usage:
- *   cuda-offload --pid PID --dir DIR --action checkpoint
+ *   cuda-offload --pid PID --dir DIR --action checkpoint [--leave-stopped]
  *   cuda-offload --pid PID --dir DIR --action restore
  *
  * By default the tool recurses into the full process subtree rooted at PID.
@@ -140,7 +140,13 @@ static int collect_pids(int root_pid, int **out_pids, int *out_n)
  * Written at checkpoint time and read at restore time to map checkpoint pids
  * to live pids when they differ (e.g. after criu restore).
  */
-#define PID_LIST_FILE "gpu-offload-pids.img"
+#define PID_LIST_FILE        "gpu-offload-pids.img"
+/*
+ * Marker written by cuda-offload checkpoint. Its presence tells the CRIU
+ * plugin to skip restore_gpu_pages during `criu restore` — cuda-offload
+ * restore will reload the pages externally.
+ */
+#define EXTERNAL_MARKER      "gpu-offload-external.marker"
 
 /*
  * Return 1 if gpu-pages-<pid>.img exists in dir_fd, 0 otherwise.
@@ -476,10 +482,15 @@ static int do_restore_one(int pid, int img_dir_fd, int img_pid)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s --pid PID --dir DIR --action checkpoint|restore [--no-recurse]\n"
+		"Usage: %s --pid PID --dir DIR --action checkpoint|restore [--no-recurse] [--leave-stopped]\n"
 		"\n"
 		"  checkpoint  lock+checkpoint GPU, spill VRAM to DIR/gpu-pages-PID.img,\n"
-		"              free CPU RAM. GPU stays frozen.\n"
+		"              free CPU RAM. GPU stays frozen (CUDA locked, process running).\n"
+		"              criu dump can follow immediately; the plugin detects the\n"
+		"              gpu-pages files and skips re-checkpointing.\n"
+		"  --leave-stopped  after checkpoint, SIGSTOP the process tree (BFS order)\n"
+		"              so it stays frozen during criu dump. Resume with proc-pause\n"
+		"              or SIGCONT before or after criu restore.\n"
 		"  restore     reload pages from image, remap into process,\n"
 		"              restore+unlock GPU.\n"
 		"\n"
@@ -490,7 +501,7 @@ static void usage(const char *prog)
 
 int main(int argc, char **argv)
 {
-	int pid = 0, recurse = 1;
+	int pid = 0, recurse = 1, leave_stopped = 0;
 	const char *dir = NULL, *action = NULL;
 	int *pids = NULL, n_pids = 0;
 	int img_dir_fd = -1;
@@ -505,6 +516,8 @@ int main(int argc, char **argv)
 			action = argv[++i];
 		else if (strcmp(argv[i], "--no-recurse") == 0)
 			recurse = 0;
+		else if (strcmp(argv[i], "--leave-stopped") == 0)
+			leave_stopped = 1;
 		else {
 			fprintf(stderr, "Unknown argument: %s\n", argv[i]);
 			usage(argv[0]);
@@ -548,6 +561,25 @@ int main(int argc, char **argv)
 			if (do_checkpoint_one(pids[i], img_dir_fd) != 0) {
 				pr_err("Checkpoint failed for pid %d\n", pids[i]);
 				ret = 1;
+			}
+		}
+
+		if (ret == 0) {
+			int mfd = openat(img_dir_fd, EXTERNAL_MARKER,
+					 O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (mfd < 0)
+				pr_perror("Cannot create " EXTERNAL_MARKER);
+			else
+				close(mfd);
+		}
+
+		if (leave_stopped && ret == 0) {
+			/* BFS order: stop parent before children */
+			for (i = 0; i < n_pids; i++) {
+				if (kill(pids[i], SIGSTOP) < 0)
+					pr_perror("SIGSTOP pid %d", pids[i]);
+				else
+					pr_info("pid %d: stopped\n", pids[i]);
 			}
 		}
 

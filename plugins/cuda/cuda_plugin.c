@@ -506,6 +506,39 @@ int cuda_plugin_pause_devices(int pid)
 		return -ENOTSUP;
 	}
 
+	/*
+	 * If cuda-offload ran before this dump, gpu-pages-<pid>.img already
+	 * holds the VRAM data and the CUDA context is in checkpointed state.
+	 * Skip all cuda-checkpoint IPC and register the pid directly.
+	 */
+	{
+		int img_dir_fd = criu_get_image_dir();
+
+		if (img_dir_fd >= 0) {
+			char gpname[64];
+			int gpfd;
+
+			snprintf(gpname, sizeof(gpname), "gpu-pages-%d.img", pid);
+			gpfd = openat(img_dir_fd, gpname, O_RDONLY);
+			if (gpfd >= 0) {
+				close(gpfd);
+				if (!plugin_added_to_inventory) {
+					if (add_inventory_plugin(CR_PLUGIN_DESC.name)) {
+						pr_err("Failed to add CUDA plugin to inventory image\n");
+						return -1;
+					}
+					plugin_added_to_inventory = true;
+				}
+				pr_info("pid %d: pre-checkpointed by cuda-offload, skipping pause\n", pid);
+				if (add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_CHECKPOINTED)) {
+					pr_err("unable to track pre-checkpointed pid %d\n", pid);
+					return -1;
+				}
+				return 0;
+			}
+		}
+	}
+
 	restore_tid = get_cuda_restore_tid(pid);
 
 	if (restore_tid == -1) {
@@ -633,29 +666,26 @@ int cuda_plugin_resume_devices_late(int pid)
 	}
 
 	img_dir_fd = criu_get_image_dir();
-	restore_tid = get_cuda_restore_tid(pid);
 
-	/* If CUDA_PLUGIN_SKIP_RESTORE is set to 1/true/yes, the orchestrator will
-	 * handle GPU restore externally (after moving the process into the GPU
-	 * cgroup). The dump was produced by cuda-offload which writes a
-	 * cuda-offload-restore marker alongside the image. Skip both
-	 * restore_gpu_pages and resume_device. Without the env var, fall through
-	 * to normal restore so plain `criu restore` still works out of the box.
+	/*
+	 * If cuda-offload checkpoint ran before this dump it wrote
+	 * gpu-offload-external.marker in the image directory.  In that case
+	 * skip restore_gpu_pages and resume_device here — cuda-offload restore
+	 * will reload the pages externally after criu restore completes.
+	 * Check before get_cuda_restore_tid() to avoid launching cuda-checkpoint
+	 * against a process whose CUDA context has not been restored yet.
 	 */
-	{
-		const char *skip = getenv("CUDA_PLUGIN_SKIP_RESTORE");
-		if (skip) {
-			char tmp[8];
-			strncpy(tmp, skip, sizeof(tmp) - 1);
-			tmp[sizeof(tmp) - 1] = '\0';
-			for (int j = 0; tmp[j]; j++)
-				tmp[j] = tolower((unsigned char)tmp[j]);
-			if (strcmp(tmp, "1") == 0 || strcmp(tmp, "true") == 0 || strcmp(tmp, "yes") == 0) {
-				pr_info("CUDA_PLUGIN_SKIP_RESTORE set, deferring restore to cuda-offload for pid %d\n", pid);
-				return 0;
-			}
+	if (img_dir_fd >= 0) {
+		int mfd = openat(img_dir_fd, "gpu-offload-external.marker", O_RDONLY);
+
+		if (mfd >= 0) {
+			close(mfd);
+			pr_info("gpu-offload-external.marker found, deferring restore to cuda-offload for pid %d\n", pid);
+			return 0;
 		}
 	}
+
+	restore_tid = get_cuda_restore_tid(pid);
 
 	if (img_dir_fd >= 0 && restore_tid != -1) {
 		syscall_addr = find_syscall_addr(pid);
