@@ -666,13 +666,14 @@ int cuda_plugin_resume_devices_late(int pid)
 	}
 
 	img_dir_fd = criu_get_image_dir();
-	restore_tid = get_cuda_restore_tid(pid);
 
 	/*
 	 * If cuda-offload checkpoint ran before this dump it wrote
 	 * gpu-offload-external.marker in the image directory.  In that case
 	 * skip restore_gpu_pages and resume_device here — cuda-offload restore
 	 * will reload the pages externally after criu restore completes.
+	 * Check before get_cuda_restore_tid() to avoid launching cuda-checkpoint
+	 * against a process whose CUDA context has not been restored yet.
 	 */
 	if (img_dir_fd >= 0) {
 		int mfd = openat(img_dir_fd, "gpu-offload-external.marker", O_RDONLY);
@@ -683,6 +684,8 @@ int cuda_plugin_resume_devices_late(int pid)
 			return 0;
 		}
 	}
+
+	restore_tid = get_cuda_restore_tid(pid);
 
 	if (img_dir_fd >= 0 && restore_tid != -1) {
 		syscall_addr = find_syscall_addr(pid);
