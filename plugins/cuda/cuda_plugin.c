@@ -668,25 +668,19 @@ int cuda_plugin_resume_devices_late(int pid)
 	img_dir_fd = criu_get_image_dir();
 	restore_tid = get_cuda_restore_tid(pid);
 
-	/* If CUDA_PLUGIN_SKIP_RESTORE is set to 1/true/yes, the orchestrator will
-	 * handle GPU restore externally (after moving the process into the GPU
-	 * cgroup). The dump was produced by cuda-offload which writes a
-	 * cuda-offload-restore marker alongside the image. Skip both
-	 * restore_gpu_pages and resume_device. Without the env var, fall through
-	 * to normal restore so plain `criu restore` still works out of the box.
+	/*
+	 * If cuda-offload checkpoint ran before this dump it wrote
+	 * gpu-offload-external.marker in the image directory.  In that case
+	 * skip restore_gpu_pages and resume_device here — cuda-offload restore
+	 * will reload the pages externally after criu restore completes.
 	 */
-	{
-		const char *skip = getenv("CUDA_PLUGIN_SKIP_RESTORE");
-		if (skip) {
-			char tmp[8];
-			strncpy(tmp, skip, sizeof(tmp) - 1);
-			tmp[sizeof(tmp) - 1] = '\0';
-			for (int j = 0; tmp[j]; j++)
-				tmp[j] = tolower((unsigned char)tmp[j]);
-			if (strcmp(tmp, "1") == 0 || strcmp(tmp, "true") == 0 || strcmp(tmp, "yes") == 0) {
-				pr_info("CUDA_PLUGIN_SKIP_RESTORE set, deferring restore to cuda-offload for pid %d\n", pid);
-				return 0;
-			}
+	if (img_dir_fd >= 0) {
+		int mfd = openat(img_dir_fd, "gpu-offload-external.marker", O_RDONLY);
+
+		if (mfd >= 0) {
+			close(mfd);
+			pr_info("gpu-offload-external.marker found, deferring restore to cuda-offload for pid %d\n", pid);
+			return 0;
 		}
 	}
 

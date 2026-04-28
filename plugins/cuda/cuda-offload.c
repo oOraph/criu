@@ -140,7 +140,13 @@ static int collect_pids(int root_pid, int **out_pids, int *out_n)
  * Written at checkpoint time and read at restore time to map checkpoint pids
  * to live pids when they differ (e.g. after criu restore).
  */
-#define PID_LIST_FILE    "gpu-offload-pids.img"
+#define PID_LIST_FILE        "gpu-offload-pids.img"
+/*
+ * Marker written by cuda-offload checkpoint. Its presence tells the CRIU
+ * plugin to skip restore_gpu_pages during `criu restore` — cuda-offload
+ * restore will reload the pages externally.
+ */
+#define EXTERNAL_MARKER      "gpu-offload-external.marker"
 
 /*
  * Return 1 if gpu-pages-<pid>.img exists in dir_fd, 0 otherwise.
@@ -556,6 +562,15 @@ int main(int argc, char **argv)
 				pr_err("Checkpoint failed for pid %d\n", pids[i]);
 				ret = 1;
 			}
+		}
+
+		if (ret == 0) {
+			int mfd = openat(img_dir_fd, EXTERNAL_MARKER,
+					 O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (mfd < 0)
+				pr_perror("Cannot create " EXTERNAL_MARKER);
+			else
+				close(mfd);
 		}
 
 		if (leave_stopped && ret == 0) {
