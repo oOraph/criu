@@ -36,7 +36,6 @@
 
 /* cuda-checkpoint binary should live in your PATH */
 #define CUDA_CHECKPOINT "cuda-checkpoint"
-#define STOPPED_MARKER_FILE "gpu-offload-stopped.marker"
 
 /* cuda-checkpoint --action flags */
 #define ACTION_LOCK	  "lock"
@@ -508,42 +507,33 @@ int cuda_plugin_pause_devices(int pid)
 	}
 
 	/*
-	 * If cuda-offload --leave-stopped already ran, the CUDA restore thread
-	 * is stopped and cuda-checkpoint queries hang (--get-state needs the
-	 * thread to respond; the process can't).  Infer state from artifacts:
-	 * stopped-marker present + gpu-pages-<pid>.img present => this pid was
-	 * pre-checkpointed.  Register it directly and skip all IPC calls.
+	 * If cuda-offload ran before this dump, gpu-pages-<pid>.img already
+	 * holds the VRAM data and the CUDA context is in checkpointed state.
+	 * Skip all cuda-checkpoint IPC and register the pid directly.
 	 */
 	{
 		int img_dir_fd = criu_get_image_dir();
 
 		if (img_dir_fd >= 0) {
-			int mfd = openat(img_dir_fd, STOPPED_MARKER_FILE, O_RDONLY);
+			char gpname[64];
+			int gpfd;
 
-			if (mfd >= 0) {
-				char gpname[64];
-				int gpfd;
-
-				close(mfd);
-				snprintf(gpname, sizeof(gpname), "gpu-pages-%d.img", pid);
-				gpfd = openat(img_dir_fd, gpname, O_RDONLY);
-				if (gpfd >= 0) {
-					close(gpfd);
-					if (!plugin_added_to_inventory) {
-						if (add_inventory_plugin(CR_PLUGIN_DESC.name)) {
-							pr_err("Failed to add CUDA plugin to inventory image\n");
-							return -1;
-						}
-						plugin_added_to_inventory = true;
-					}
-					pr_info("pid %d: pre-checkpointed by cuda-offload, skipping pause\n", pid);
-					if (add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_CHECKPOINTED)) {
-						pr_err("unable to track pre-checkpointed pid %d\n", pid);
+			snprintf(gpname, sizeof(gpname), "gpu-pages-%d.img", pid);
+			gpfd = openat(img_dir_fd, gpname, O_RDONLY);
+			if (gpfd >= 0) {
+				close(gpfd);
+				if (!plugin_added_to_inventory) {
+					if (add_inventory_plugin(CR_PLUGIN_DESC.name)) {
+						pr_err("Failed to add CUDA plugin to inventory image\n");
 						return -1;
 					}
-					return 0;
+					plugin_added_to_inventory = true;
 				}
-				pr_info("pid %d: stopped-marker found but no GPU pages, skipping\n", pid);
+				pr_info("pid %d: pre-checkpointed by cuda-offload, skipping pause\n", pid);
+				if (add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_CHECKPOINTED)) {
+					pr_err("unable to track pre-checkpointed pid %d\n", pid);
+					return -1;
+				}
 				return 0;
 			}
 		}
@@ -697,28 +687,6 @@ int cuda_plugin_resume_devices_late(int pid)
 				pr_info("CUDA_PLUGIN_SKIP_RESTORE set, deferring restore to cuda-offload for pid %d\n", pid);
 				return 0;
 			}
-		}
-	}
-
-	/*
-	 * If the dump was produced by `cuda-offload --leave-stopped`, criu's
-	 * finalize_restore() has already queued a SIGSTOP on this process
-	 * (to re-enter stopped state after restore).  SIGSTOP is sent to the
-	 * entire thread group, so it affects both the main thread and the CUDA
-	 * restore thread used by resume_restore_thread.  SIGCONT cancels the
-	 * pending SIGSTOP for all threads before any ptrace resumes happen.
-	 *
-	 * Note: SIGCONT itself becomes a pending signal on the ptraced process.
-	 * inject_syscall's signal-drain loop handles this by suppressing the
-	 * SIGCONT delivery stop before reading the syscall return value.
-	 */
-	if (img_dir_fd >= 0) {
-		int marker_fd = openat(img_dir_fd, STOPPED_MARKER_FILE, O_RDONLY);
-
-		if (marker_fd >= 0) {
-			close(marker_fd);
-			pr_info("pid %d: stopped-marker found, sending SIGCONT to clear pending SIGSTOP\n", pid);
-			kill(pid, SIGCONT);
 		}
 	}
 

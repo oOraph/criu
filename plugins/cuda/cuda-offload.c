@@ -141,7 +141,6 @@ static int collect_pids(int root_pid, int **out_pids, int *out_n)
  * to live pids when they differ (e.g. after criu restore).
  */
 #define PID_LIST_FILE    "gpu-offload-pids.img"
-#define STOPPED_MARKER_FILE "gpu-offload-stopped.marker"
 
 /*
  * Return 1 if gpu-pages-<pid>.img exists in dir_fd, 0 otherwise.
@@ -477,26 +476,23 @@ static int do_restore_one(int pid, int img_dir_fd, int img_pid)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s --pid PID --dir DIR --action checkpoint|restore [--no-recurse] [--leave-stopped]\n"
+		"Usage: %s --pid PID --dir DIR --action checkpoint|restore [--no-recurse]\n"
 		"\n"
 		"  checkpoint  lock+checkpoint GPU, spill VRAM to DIR/gpu-pages-PID.img,\n"
-		"              free CPU RAM. GPU stays frozen.\n"
+		"              free CPU RAM. GPU stays frozen (CUDA locked, process running).\n"
+		"              criu dump can follow immediately; the plugin detects the\n"
+		"              gpu-pages files and skips re-checkpointing.\n"
 		"  restore     reload pages from image, remap into process,\n"
 		"              restore+unlock GPU.\n"
 		"\n"
 		"  By default all processes in the subtree rooted at PID are handled.\n"
-		"  Use --no-recurse to operate on PID only.\n"
-		"\n"
-		"  --leave-stopped  (checkpoint only) leave each process in SIGSTOP'd state\n"
-		"                   after offload, so that `criu dump` can follow immediately.\n"
-		"                   Writes " STOPPED_MARKER_FILE " to DIR so `criu restore`\n"
-		"                   knows to send SIGCONT via the cuda plugin.\n",
+		"  Use --no-recurse to operate on PID only.\n",
 		prog);
 }
 
 int main(int argc, char **argv)
 {
-	int pid = 0, recurse = 1, leave_stopped = 0;
+	int pid = 0, recurse = 1;
 	const char *dir = NULL, *action = NULL;
 	int *pids = NULL, n_pids = 0;
 	int img_dir_fd = -1;
@@ -511,8 +507,6 @@ int main(int argc, char **argv)
 			action = argv[++i];
 		else if (strcmp(argv[i], "--no-recurse") == 0)
 			recurse = 0;
-		else if (strcmp(argv[i], "--leave-stopped") == 0)
-			leave_stopped = 1;
 		else {
 			fprintf(stderr, "Unknown argument: %s\n", argv[i]);
 			usage(argv[0]);
@@ -557,31 +551,6 @@ int main(int argc, char **argv)
 				pr_err("Checkpoint failed for pid %d\n", pids[i]);
 				ret = 1;
 			}
-		}
-
-		if (leave_stopped) {
-			int fd;
-
-			/*
-			 * Stop the entire tree in BFS order (parent first) so the
-			 * parent cannot react to a stopped child before it is itself
-			 * stopped.  Pids without a CUDA context were never ptrace-
-			 * attached, so they must be stopped here via kill() just like
-			 * the rest.
-			 */
-			for (i = 0; i < n_pids; i++) {
-				if (kill(pids[i], SIGSTOP) < 0)
-					pr_perror("Failed to SIGSTOP pid %d", pids[i]);
-				else
-					pr_info("pid %d: stopped\n", pids[i]);
-			}
-
-			fd = openat(img_dir_fd, STOPPED_MARKER_FILE,
-				    O_WRONLY | O_CREAT | O_TRUNC, 0644);
-			if (fd < 0)
-				pr_perror("Cannot write " STOPPED_MARKER_FILE);
-			else
-				close(fd);
 		}
 
 	} else if (strcmp(action, "restore") == 0) {
