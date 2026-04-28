@@ -1,9 +1,9 @@
 /*
- * cuda-pause - pause and resume a process tree via SIGSTOP/SIGCONT
+ * proc-pause - pause and resume a process tree via SIGSTOP/SIGCONT
  *
  * Usage:
- *   cuda-pause --pid PID --action pause
- *   cuda-pause --pid PID --action resume
+ *   proc-pause --pid PID --action pause
+ *   proc-pause --pid PID --action resume
  *
  * pause: sends SIGSTOP to the process tree in BFS order (parent before
  *        children) so the parent cannot react to a stopped child before it
@@ -14,9 +14,9 @@
  *
  * Intended use around criu dump:
  *   cuda-offload --pid PID --dir DIR --action checkpoint
- *   cuda-pause   --pid PID --action pause
+ *   proc-pause   --pid PID --action pause
  *   criu dump    -t PID -D DIR ...
- *   cuda-pause   --pid PID --action resume   # optional; criu restore handles it
+ *   proc-pause   --pid PID --action resume   # optional; criu restore handles it
  *
  * Timer note: wall-clock timers (alarm, ITIMER_REAL, CLOCK_REALTIME) keep
  * ticking while the process tree is stopped.  Keep the freeze window shorter
@@ -32,9 +32,9 @@
 #include <string.h>
 #include <unistd.h>
 
-#define pr_info(fmt, ...)   fprintf(stderr, "cuda-pause: " fmt, ##__VA_ARGS__)
-#define pr_err(fmt, ...)    fprintf(stderr, "cuda-pause: ERROR: " fmt, ##__VA_ARGS__)
-#define pr_perror(fmt, ...) fprintf(stderr, "cuda-pause: ERROR: " fmt ": %s\n", \
+#define pr_info(fmt, ...)   fprintf(stderr, "proc-pause: " fmt, ##__VA_ARGS__)
+#define pr_err(fmt, ...)    fprintf(stderr, "proc-pause: ERROR: " fmt, ##__VA_ARGS__)
+#define pr_perror(fmt, ...) fprintf(stderr, "proc-pause: ERROR: " fmt ": %s\n", \
 				    ##__VA_ARGS__, strerror(errno))
 
 static int append_pid(int **pids, int *n, int *cap, int pid)

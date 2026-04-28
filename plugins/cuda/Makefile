@@ -1,7 +1,7 @@
 PLUGIN_NAME := cuda_plugin
 PLUGIN_SOBJ := cuda_plugin.so
 OFFLOAD_BIN := cuda-offload
-PAUSE_BIN   := cuda-pause
+PAUSE_BIN   := proc-pause
 
 DEPS_CUDA := $(PLUGIN_SOBJ)
 
@@ -37,7 +37,7 @@ cuda-offload: cuda-offload.c cuda_gpu_pages.o
 	$(call msg-gen, $@)
 	$(Q) $(CC) -Wall -Werror -g $^ -o $@
 
-cuda-pause: cuda-pause.c
+proc-pause: proc-pause.c
 	$(call msg-gen, $@)
 	$(Q) $(CC) -Wall -Werror -g $< -o $@
 
