@@ -1,0 +1,59 @@
+#!/bin/sh
+# criu-restore-timens - wrapper around 'criu restore' that adjusts the time
+# namespace clocks to compensate for the pre-dump SIGSTOP freeze introduced
+# by 'cuda-offload checkpoint --leave-stopped'.
+#
+# When cuda-offload freezes a process tree before criu dump, it writes
+# gpu-offload-freeze-ns.txt in the image directory containing the CLOCK_BOOTTIME
+# value (nanoseconds) at the moment of freeze.  criu restore already corrects
+# for the dump->restore gap via its built-in timens support; this script adds
+# the extra sigstop->dump gap on top of that via --timens-monotonic and
+# --timens-boottime.
+#
+# Without this correction, application timers based on CLOCK_MONOTONIC or
+# CLOCK_BOOTTIME (Go's time.After, gRPC deadlines, most connection pools) would
+# see the full freeze duration and expire immediately after restore.
+#
+# Usage: criu-restore-timens -D DIR [other criu restore flags...]
+# All flags are passed through verbatim to criu restore.
+#
+# CLOCK_REALTIME-based deadlines are not fixable from outside the process.
+#
+# Requires: criu with timens support (kernel 5.6+, criu 3.15+).
+
+set -e
+
+DIR=""
+args=""
+prev=""
+
+for arg in "$@"; do
+	case "$prev" in
+		-D|--images-dir) DIR="$arg" ;;
+	esac
+	prev="$arg"
+done
+
+FREEZE_TS_FILE="${DIR}/gpu-offload-freeze-ns.txt"
+
+if [ -z "$DIR" ] || [ ! -f "$FREEZE_TS_FILE" ]; then
+	exec criu restore "$@"
+fi
+
+T_freeze=$(cat "$FREEZE_TS_FILE")
+
+# /proc/uptime gives CLOCK_BOOTTIME in seconds (two decimal places = 10ms resolution).
+T_now_s=$(awk '{print $1}' /proc/uptime)
+# Convert to nanoseconds using awk to avoid shell floating-point limitations.
+T_now=$(awk -v t="$T_now_s" 'BEGIN { printf "%.0f\n", t * 1000000000 }')
+
+OFFSET=$(( T_now - T_freeze ))
+
+if [ "$OFFSET" -lt 0 ]; then
+	echo "criu-restore-timens: WARNING: freeze timestamp is in the future (clock skew?), ignoring" >&2
+	exec criu restore "$@"
+fi
+
+echo "criu-restore-timens: pre-dump freeze duration: ${OFFSET} ns ($(( OFFSET / 1000000 )) ms)" >&2
+
+exec criu restore "$@" --timens-monotonic "$OFFSET" --timens-boottime "$OFFSET"

@@ -44,11 +44,13 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define pr_info(fmt, ...)   fprintf(stderr, "cuda-offload: " fmt, ##__VA_ARGS__)
@@ -147,6 +149,13 @@ static int collect_pids(int root_pid, int **out_pids, int *out_n)
  * restore will reload the pages externally.
  */
 #define EXTERNAL_MARKER      "gpu-offload-external.marker"
+/*
+ * Written by cuda-offload checkpoint --leave-stopped just before SIGSTOPping
+ * the process tree. Contains the CLOCK_BOOTTIME value in nanoseconds at the
+ * moment of freeze. Used by criu-restore-timens to compute the timens offset
+ * that compensates for the pre-dump freeze duration.
+ */
+#define FREEZE_TS_FILE       "gpu-offload-freeze-ns.txt"
 
 /*
  * Return 1 if gpu-pages-<pid>.img exists in dir_fd, 0 otherwise.
@@ -574,6 +583,31 @@ int main(int argc, char **argv)
 		}
 
 		if (leave_stopped && ret == 0) {
+			struct timespec ts;
+
+			/*
+			 * Record CLOCK_BOOTTIME before stopping so criu restore
+			 * can compute the pre-dump freeze duration and pass it as
+			 * a timens offset to prevent application timer timeouts.
+			 */
+			if (clock_gettime(CLOCK_BOOTTIME, &ts) == 0) {
+				unsigned long long ns = (unsigned long long)ts.tv_sec * 1000000000ULL
+						      + (unsigned long long)ts.tv_nsec;
+				char buf[32];
+				int n, tsfd;
+
+				n = snprintf(buf, sizeof(buf), "%llu\n", ns);
+				tsfd = openat(img_dir_fd, FREEZE_TS_FILE,
+					      O_WRONLY | O_CREAT | O_TRUNC, 0644);
+				if (tsfd < 0)
+					pr_perror("Cannot create " FREEZE_TS_FILE);
+				else {
+					if (write(tsfd, buf, n) != n)
+						pr_perror("Cannot write " FREEZE_TS_FILE);
+					close(tsfd);
+				}
+			}
+
 			/* BFS order: stop parent before children */
 			for (i = 0; i < n_pids; i++) {
 				if (kill(pids[i], SIGSTOP) < 0)
