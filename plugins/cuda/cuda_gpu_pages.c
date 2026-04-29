@@ -476,52 +476,23 @@ long inject_syscall(int tid, uint64_t syscall_addr,
 		return LONG_MIN;
 	}
 
-	/*
-	 * Two cases require looping rather than a single PTRACE_SINGLESTEP:
-	 *
-	 * 1. Syscall-exit ptrace-stop: when compel_stop_on_syscall leaves the
-	 *    thread at the exit of a syscall, PTRACE_SINGLESTEP fires its
-	 *    SIGTRAP as the kernel returns to user space via sysret — before
-	 *    the instruction at the new RIP executes.  rip == syscall_addr
-	 *    after that stop means the syscall hasn't run yet; loop and
-	 *    singlestep again.
-	 *
-	 * 2. Syscall-entry stop (WSTOPSIG == SIGTRAP|0x80): TIF_SYSCALL_TRACE
-	 *    left active by compel_stop_on_syscall fires at the entry of our
-	 *    injected syscall before it executes.  Advance to the exit stop
-	 *    with PTRACE_SYSCALL to get the real rax.
-	 */
-	do {
-		if (ptrace(PTRACE_SINGLESTEP, tid, NULL, NULL) < 0) {
-			pr_perror("PTRACE_SINGLESTEP failed for tid %d", tid);
-			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-			return LONG_MIN;
-		}
-		if (waitpid(tid, &status, __WALL) < 0) {
-			pr_perror("waitpid after SINGLESTEP failed for tid %d", tid);
-			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-			return LONG_MIN;
-		}
+	if (ptrace(PTRACE_SINGLESTEP, tid, NULL, NULL) < 0) {
+		pr_perror("PTRACE_SINGLESTEP failed for tid %d", tid);
+		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+		return LONG_MIN;
+	}
 
-		if (WIFSTOPPED(status) && (WSTOPSIG(status) & 0x80)) {
-			if (ptrace(PTRACE_SYSCALL, tid, NULL, NULL) < 0) {
-				pr_perror("PTRACE_SYSCALL past entry stop failed for tid %d", tid);
-				ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-				return LONG_MIN;
-			}
-			if (waitpid(tid, &status, __WALL) < 0) {
-				pr_perror("waitpid at syscall exit failed for tid %d", tid);
-				ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-				return LONG_MIN;
-			}
-		}
+	if (waitpid(tid, &status, __WALL) < 0) {
+		pr_perror("waitpid after SINGLESTEP failed for tid %d", tid);
+		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+		return LONG_MIN;
+	}
 
-		if (ptrace(PTRACE_GETREGS, tid, NULL, &after_regs) < 0) {
-			pr_perror("PTRACE_GETREGS after syscall failed for tid %d", tid);
-			ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
-			return LONG_MIN;
-		}
-	} while (after_regs.rip == syscall_addr);
+	if (ptrace(PTRACE_GETREGS, tid, NULL, &after_regs) < 0) {
+		pr_perror("PTRACE_GETREGS after syscall failed for tid %d", tid);
+		ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs);
+		return LONG_MIN;
+	}
 
 	if (ptrace(PTRACE_SETREGS, tid, NULL, &saved_regs) < 0) {
 		pr_perror("PTRACE_SETREGS restore failed for tid %d", tid);
