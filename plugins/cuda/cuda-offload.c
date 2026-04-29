@@ -621,20 +621,25 @@ static int do_restore_one(int pid, int img_dir_fd, int img_pid)
 		return -1;
 	}
 
-	/*
-	 * 3. Clear the group-stop that CRIU faithfully restored (the process was
-	 * dumped while in group-stop from the SIGSTOP at checkpoint step 5).
-	 * Without SIGCONT, PTRACE_CONT returns immediately but the restore thread
-	 * re-enters group-stop before executing a single instruction.
-	 * Threads already in ptrace-stop (main thread seized above) are unaffected
-	 * by SIGCONT because wake_up_state() only wakes TASK_STOPPED, not
-	 * TASK_TRACED.
-	 */
-	kill(pid, SIGCONT);
+	/* 3. Resume only the restore thread for CUDA restore + unlock */
 	if (resume_one_thread(restore_tid, &save_sigset) != 0) {
 		ptrace_detach_stopped(restore_tid);
 		return -1;
 	}
+	/*
+	 * After PTRACE_CONT, the restore thread exits TASK_TRACED and immediately
+	 * re-enters TASK_STOPPED because SIGNAL_STOP_STOPPED is still set from the
+	 * group-stop the process was in (either from cuda-offload checkpoint detach
+	 * or from criu restore --leave-stopped).  SIGCONT clears SIGNAL_STOP_STOPPED
+	 * and wakes all TASK_STOPPED threads including the restore thread.  Threads
+	 * already in TASK_TRACED (the main thread seized by the outer loop) are
+	 * unaffected because wake_up_state() only wakes __TASK_STOPPED.
+	 *
+	 * The ordering (PTRACE_CONT then SIGCONT) is intentional: PTRACE_CONT must
+	 * transition the restore thread from TASK_TRACED to TASK_STOPPED first so
+	 * that SIGCONT can reach it via wake_up_state(__TASK_STOPPED).
+	 */
+	kill(pid, SIGCONT);
 
 	t0 = now_ms();
 	if (run_cuda_checkpoint(pid, "restore") != 0) {
