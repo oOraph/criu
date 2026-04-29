@@ -57,3 +57,64 @@ plugin will re-wake when needed.
 * NVIDIA UVM Managed Memory, MIG (Multi Instance GPU), and MPS (Multi-Process
   Service) are currently not supported for checkpointing. Future CUDA releases
   will add support for these.
+
+# cuda-offload: External Two-Step Checkpoint Tool
+
+`cuda-offload` is a standalone binary that implements an alternative
+checkpoint/restore flow where VRAM offload happens **outside** of CRIU, before
+the dump and after the restore.  This avoids CRIU touching GPU pages at all and
+allows using O_DIRECT I/O for the GPU image files.
+
+This separation also enables **light vs. heavy** checkpoint/restore:
+- **Heavy** (full migration): run both `cuda-offload checkpoint` + `criu dump`
+  on one machine and `criu restore` + `cuda-offload restore` on another.
+  VRAM pages travel with the CRIU image.
+- **Light** (GPU-only preemption): run `cuda-offload checkpoint` to evict VRAM
+  to disk and free the GPU, then `cuda-offload restore` later on the same
+  machine — no `criu dump`/`restore` needed.  CPU state is never touched.
+
+## Flow
+
+**Checkpoint** (run before `criu dump`):
+1. `cuda-offload --action checkpoint --pid PID` seizes the whole process tree
+   with `PTRACE_SEIZE + PTRACE_INTERRUPT`, freezing every process.
+2. For each process with a CUDA context: lock → resume restore thread →
+   `cuda-checkpoint --action checkpoint` → re-freeze restore thread.
+3. New anonymous VMAs created by the checkpoint (VRAM data now in CPU RAM) are
+   identified by diffing `/proc/pid/maps` before and after, dumped to
+   `gpu-pages-<pid>.img` with `process_vm_readv`, then freed with an injected
+   `madvise(MADV_DONTNEED)` so CRIU skips them in its page walk.
+4. Wall-clock timers (`ITIMER_REAL`, POSIX `CLOCK_REALTIME/MONOTONIC/BOOTTIME`)
+   are **saved and disarmed** at seize time and written to
+   `gpu-offload-timers-<pid>.img`.
+5. The whole tree is detached with `SIGSTOP` so it stays frozen for `criu dump`.
+
+**Restore** (run after `criu restore`):
+1. `criu restore` brings back the process tree.  The CRIU cuda plugin detects
+   `gpu-offload-external.marker` and returns immediately without calling
+   `resume_device`, leaving the processes in the same stopped state they were
+   dumped in (group-stop from the SIGSTOP in step 5 above).
+2. `cuda-offload --action restore --pid PID` seizes the tree again and, for
+   each process with a GPU image: injects `mmap(MAP_SHARED) + mlock` to reload
+   pages from `gpu-pages-<pid>.img` into the process address space.
+3. The restore thread is seized and resumed.  A `SIGCONT` is sent to the
+   process to clear the group-stop that CRIU faithfully restored — without it
+   the thread re-enters group-stop immediately after `PTRACE_CONT` and
+   `cuda-checkpoint --action restore` hangs waiting for it.  This matches the
+   `cuda_plugin.c` `RESUME_DEVICES_LATE` behaviour where the whole process is
+   already running when restore is triggered.
+4. `cuda-checkpoint --action restore` then `--action unlock` drive VRAM reload.
+5. Wall-clock timers are **re-armed** from the saved image, corrected for the
+   elapsed freeze time, overriding CRIU's own timer restore.
+6. The tree is detached with `SIGCONT` to resume normal execution.
+
+## Ptrace stop vs. group-stop after CRIU restore
+
+CRIU restores process state exactly as it was at dump time.  Because the
+process was dumped while in group-stop (SIGSTOP from step 5 of checkpoint),
+after `criu restore` it is still in group-stop.  When cuda-offload seizes a
+thread and calls `PTRACE_CONT`, the kernel group-stop state is still active and
+the thread re-enters group-stop immediately instead of running.  The fix is to
+call `kill(pid, SIGCONT)` right after `PTRACE_CONT`; threads already in
+ptrace-stop (the main thread seized by cuda-offload's outer loop) are
+unaffected.
