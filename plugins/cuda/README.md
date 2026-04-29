@@ -118,3 +118,20 @@ the thread re-enters group-stop immediately instead of running.  The fix is to
 call `kill(pid, SIGCONT)` right after `PTRACE_CONT`; threads already in
 ptrace-stop (the main thread seized by cuda-offload's outer loop) are
 unaffected.
+
+## TODO: timens to prevent gunicorn worker-timeout on restore
+
+After restore, gunicorn's arbiter detects that the worker (pid 1700) has not
+updated its heartbeat file for longer than `worker_timeout` seconds and kills it
+immediately.  This is because the arbiter compares `time.monotonic()` (which
+maps to `CLOCK_MONOTONIC`) against the timestamp last written by the worker, and
+that timestamp is from before the freeze.  If the total freeze window (criu dump
++ cuda-offload restore) exceeds the remaining timeout at checkpoint time, the
+worker is considered dead on restore.
+
+The fix is to configure CRIU to restore `CLOCK_MONOTONIC` via a time namespace
+(`timens`) so that the restored process sees the clock as if no real time
+elapsed during the freeze.  CRIU supports this via `--timens-realtime` and
+`--timens-monotonic` offsets, or via `criu_opts.clock_restore`.  Once timens is
+properly configured, `time.monotonic()` in the restored processes will return
+values consistent with pre-freeze time, and the heartbeat check will pass.

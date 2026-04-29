@@ -385,8 +385,11 @@ static void ptrace_detach_resume(int pid)
  * Resume a single thread for CUDA IPC while the rest of the process stays
  * frozen.  Blocks all signals except SIGTRAP to prevent spurious delivery
  * during the brief resume window.  Saves the original sigmask in *save.
+ *
+ * Callers that need to clear a group-stop (restore path only) must call
+ * kill(pid, SIGCONT) before this function.
  */
-static int resume_one_thread(int pid, int tid, k_sigset_t *save)
+static int resume_one_thread(int tid, k_sigset_t *save)
 {
 	k_sigset_t block;
 
@@ -406,14 +409,6 @@ static int resume_one_thread(int pid, int tid, k_sigset_t *save)
 		ptrace(PTRACE_SETSIGMASK, tid, sizeof(*save), save);
 		return -1;
 	}
-	/*
-	 * If the process was in group-stop (e.g. CRIU restored it while stopped),
-	 * PTRACE_CONT alone does not exit group-stop — the thread re-enters it
-	 * immediately.  SIGCONT clears the group-stop for the whole process so the
-	 * thread can actually execute.  Threads already in ptrace-stop (main thread
-	 * seized by the outer loop) are unaffected by SIGCONT.
-	 */
-	kill(pid, SIGCONT);
 	return 0;
 }
 
@@ -501,7 +496,7 @@ static int do_checkpoint_one(int pid, int img_dir_fd)
 	 * VRAM->RAM transfer.  All other threads (including the main thread)
 	 * remain in ptrace-stop throughout.
 	 */
-	if (resume_one_thread(pid, restore_tid, &save_sigset) != 0) {
+	if (resume_one_thread(restore_tid, &save_sigset) != 0) {
 		ret = -1;
 		goto out_interrupt;
 	}
@@ -626,8 +621,17 @@ static int do_restore_one(int pid, int img_dir_fd, int img_pid)
 		return -1;
 	}
 
-	/* 3. Resume only the restore thread for CUDA restore + unlock */
-	if (resume_one_thread(pid, restore_tid, &save_sigset) != 0) {
+	/*
+	 * 3. Clear the group-stop that CRIU faithfully restored (the process was
+	 * dumped while in group-stop from the SIGSTOP at checkpoint step 5).
+	 * Without SIGCONT, PTRACE_CONT returns immediately but the restore thread
+	 * re-enters group-stop before executing a single instruction.
+	 * Threads already in ptrace-stop (main thread seized above) are unaffected
+	 * by SIGCONT because wake_up_state() only wakes TASK_STOPPED, not
+	 * TASK_TRACED.
+	 */
+	kill(pid, SIGCONT);
+	if (resume_one_thread(restore_tid, &save_sigset) != 0) {
 		ptrace_detach_stopped(restore_tid);
 		return -1;
 	}
