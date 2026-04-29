@@ -57,7 +57,14 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <stdint.h>
 #include <unistd.h>
+
+/*
+ * PTRACE_GETSIGMASK/SETSIGMASK require the kernel sigset size (8 bytes),
+ * not glibc's sigset_t (128 bytes).  EINVAL results if the wrong size is used.
+ */
+typedef struct { uint64_t sig; } k_sigset_t;
 
 #define pr_info(fmt, ...)   fprintf(stderr, "cuda-offload: " fmt, ##__VA_ARGS__)
 #define pr_warn(fmt, ...)   fprintf(stderr, "cuda-offload: WARNING: " fmt, ##__VA_ARGS__)
@@ -379,16 +386,15 @@ static void ptrace_detach_resume(int pid)
  * frozen.  Blocks all signals except SIGTRAP to prevent spurious delivery
  * during the brief resume window.  Saves the original sigmask in *save.
  */
-static int resume_one_thread(int tid, sigset_t *save)
+static int resume_one_thread(int tid, k_sigset_t *save)
 {
-	sigset_t block;
+	k_sigset_t block;
 
 	if (ptrace(PTRACE_GETSIGMASK, tid, sizeof(*save), save) < 0) {
 		pr_perror("PTRACE_GETSIGMASK failed for tid %d", tid);
 		return -1;
 	}
-	sigfillset(&block);
-	sigdelset(&block, SIGTRAP);
+	block.sig = ~0ULL & ~(1ULL << (SIGTRAP - 1));
 	if (ptrace(PTRACE_SETSIGMASK, tid, sizeof(block), &block) < 0) {
 		pr_perror("PTRACE_SETSIGMASK failed for tid %d", tid);
 		return -1;
@@ -407,7 +413,7 @@ static int resume_one_thread(int tid, sigset_t *save)
  * Re-interrupt a thread after CUDA IPC and restore its original sigmask.
  * Also sets PTRACE_O_SUSPEND_SECCOMP to prevent seccomp interference.
  */
-static int interrupt_one_thread(int tid, sigset_t *save)
+static int interrupt_one_thread(int tid, k_sigset_t *save)
 {
 	int status;
 
@@ -424,7 +430,7 @@ static int interrupt_one_thread(int tid, sigset_t *save)
 		/* non-fatal: seccomp may not be active */
 	}
 	if (ptrace(PTRACE_SETSIGMASK, tid, sizeof(*save), save) < 0) {
-		pr_perror("PTRACE_SETSIGMASK restore failed for tid %d", tid);
+		pr_perror("PTRACE_SETSIGMASK failed for tid %d", tid);
 		return -1;
 	}
 	return 0;
@@ -448,7 +454,7 @@ static int do_checkpoint_one(int pid, int img_dir_fd)
 	double t0, elapsed;
 	double total_mb = 0;
 	uint64_t syscall_addr;
-	sigset_t save_sigset;
+	k_sigset_t save_sigset;
 	int restore_tid;
 	int i, ret = 0;
 
@@ -584,7 +590,7 @@ out:
  */
 static int do_restore_one(int pid, int img_dir_fd, int img_pid)
 {
-	sigset_t save_sigset;
+	k_sigset_t save_sigset;
 	uint64_t syscall_addr;
 	int restore_tid;
 	double t0;
