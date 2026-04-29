@@ -309,6 +309,11 @@ int dump_gpu_pages(int pid, int img_dir_fd, struct gpu_region *regions, int coun
 	 */
 	fd = openat(img_dir_fd, fname,
 		    O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0600);
+	if (fd < 0 && errno == EINVAL) {
+		pr_info("O_DIRECT not supported for dump, falling back to buffered I/O\n");
+		fd = openat(img_dir_fd, fname,
+			    O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	}
 	if (fd < 0) {
 		pr_perror("Cannot create %s", fname);
 		return -1;
