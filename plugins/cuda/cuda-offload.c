@@ -386,7 +386,7 @@ static void ptrace_detach_resume(int pid)
  * frozen.  Blocks all signals except SIGTRAP to prevent spurious delivery
  * during the brief resume window.  Saves the original sigmask in *save.
  */
-static int resume_one_thread(int tid, k_sigset_t *save)
+static int resume_one_thread(int pid, int tid, k_sigset_t *save)
 {
 	k_sigset_t block;
 
@@ -406,6 +406,14 @@ static int resume_one_thread(int tid, k_sigset_t *save)
 		ptrace(PTRACE_SETSIGMASK, tid, sizeof(*save), save);
 		return -1;
 	}
+	/*
+	 * If the process was in group-stop (e.g. CRIU restored it while stopped),
+	 * PTRACE_CONT alone does not exit group-stop — the thread re-enters it
+	 * immediately.  SIGCONT clears the group-stop for the whole process so the
+	 * thread can actually execute.  Threads already in ptrace-stop (main thread
+	 * seized by the outer loop) are unaffected by SIGCONT.
+	 */
+	kill(pid, SIGCONT);
 	return 0;
 }
 
@@ -469,7 +477,6 @@ static int do_checkpoint_one(int pid, int img_dir_fd)
 		pr_info("pid %d: no CUDA context, skipping\n", pid);
 		return 0;
 	}
-
 	/* 1. Lock CUDA (quiesce the runtime via UVM driver, process stays frozen) */
 	t0 = now_ms();
 	if (run_cuda_checkpoint(pid, "lock") != 0) {
@@ -494,7 +501,7 @@ static int do_checkpoint_one(int pid, int img_dir_fd)
 	 * VRAM->RAM transfer.  All other threads (including the main thread)
 	 * remain in ptrace-stop throughout.
 	 */
-	if (resume_one_thread(restore_tid, &save_sigset) != 0) {
+	if (resume_one_thread(pid, restore_tid, &save_sigset) != 0) {
 		ret = -1;
 		goto out_interrupt;
 	}
@@ -620,7 +627,7 @@ static int do_restore_one(int pid, int img_dir_fd, int img_pid)
 	}
 
 	/* 3. Resume only the restore thread for CUDA restore + unlock */
-	if (resume_one_thread(restore_tid, &save_sigset) != 0) {
+	if (resume_one_thread(pid, restore_tid, &save_sigset) != 0) {
 		ptrace_detach_stopped(restore_tid);
 		return -1;
 	}
