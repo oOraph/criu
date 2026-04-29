@@ -16,11 +16,10 @@
  *   1. PTRACE_SEIZE + PTRACE_INTERRUPT the process tree (all T_STOPPED from criu)
  *   2. Inject mmap(MAP_FIXED|MAP_SHARED) from image file over GPU VMAs
  *   3. Inject MADV_POPULATE_READ + mlock to fault pages in
- *   4. Resume ONLY the CUDA restore thread
- *   5. cuda-checkpoint --action restore  (pages -> VRAM via UVM driver)
- *   6. cuda-checkpoint --action unlock
- *   7. Re-interrupt the restore thread
- *   8. PTRACE_DETACH in reverse BFS order + SIGCONT -> process tree resumes
+ *   4. Re-arm wall-clock timers from saved image
+ *   5. PTRACE_DETACH in reverse BFS order + SIGCONT -> process tree resumes
+ *   6. cuda-checkpoint --action restore  (pages -> VRAM, process fully running)
+ *   7. cuda-checkpoint --action unlock
  *
  * Timer correctness: wall-clock timers (ITIMER_REAL, POSIX CLOCK_REALTIME/
  * MONOTONIC/BOOTTIME) are saved and disarmed at seize time in op 1, then
@@ -581,20 +580,18 @@ out:
 /* ---- per-pid restore ---- */
 
 /*
- * Restore one process.  The caller must have already PTRACE_SEIZE'd pid
- * (pid is in ptrace-stop, as left by criu restore --leave-stopped).
+ * Inject GPU pages back into one process while it is still frozen in
+ * ptrace-stop.  The caller must have already PTRACE_SEIZE'd pid.
  * img_pid is the pid encoded in the image filename.
  *
- * On return pid is still in ptrace-stop; the caller detaches in reverse BFS
- * order and sends SIGCONT to resume the whole tree.
+ * Only remaps memory; CUDA restore is driven separately after all processes
+ * are released (see Phase 3 in main()).
  *
  * Returns 0 on success, -1 on error.
  */
 static int do_restore_one(int pid, int img_dir_fd, int img_pid)
 {
-	k_sigset_t save_sigset;
 	uint64_t syscall_addr;
-	int restore_tid;
 	double t0;
 
 	syscall_addr = find_syscall_addr(pid);
@@ -603,70 +600,10 @@ static int do_restore_one(int pid, int img_dir_fd, int img_pid)
 		return -1;
 	}
 
-	/* 1. Remap GPU VMAs from the image file (mmap injection, no CUDA needed) */
 	t0 = now_ms();
 	if (restore_gpu_pages(pid, img_pid, syscall_addr, img_dir_fd) != 0)
 		return -1;
 	pr_info("[timing] pid %d mmap+mlock: %.0f ms\n", pid, now_ms() - t0);
-
-	restore_tid = get_restore_tid(pid);
-	if (restore_tid == -1) {
-		pr_warn("pid %d: no CUDA restore thread found after page restore\n", pid);
-		return -1;
-	}
-
-	/* 2. Seize the restore thread */
-	if (ptrace_seize_stop(restore_tid) != 0) {
-		pr_err("pid %d: failed to seize restore_tid %d\n", pid, restore_tid);
-		return -1;
-	}
-
-	/* 3. Resume only the restore thread for CUDA restore + unlock */
-	if (resume_one_thread(restore_tid, &save_sigset) != 0) {
-		ptrace_detach_stopped(restore_tid);
-		return -1;
-	}
-	/*
-	 * After PTRACE_CONT, the restore thread exits TASK_TRACED and immediately
-	 * re-enters TASK_STOPPED because SIGNAL_STOP_STOPPED is still set from the
-	 * group-stop the process was in (either from cuda-offload checkpoint detach
-	 * or from criu restore --leave-stopped).  SIGCONT clears SIGNAL_STOP_STOPPED
-	 * and wakes all TASK_STOPPED threads including the restore thread.  Threads
-	 * already in TASK_TRACED (the main thread seized by the outer loop) are
-	 * unaffected because wake_up_state() only wakes __TASK_STOPPED.
-	 *
-	 * The ordering (PTRACE_CONT then SIGCONT) is intentional: PTRACE_CONT must
-	 * transition the restore thread from TASK_TRACED to TASK_STOPPED first so
-	 * that SIGCONT can reach it via wake_up_state(__TASK_STOPPED).
-	 */
-	kill(pid, SIGCONT);
-
-	t0 = now_ms();
-	if (run_cuda_checkpoint(pid, "restore") != 0) {
-		pr_err("pid %d: cuda-checkpoint restore failed\n", pid);
-		interrupt_one_thread(restore_tid, &save_sigset);
-		ptrace_detach_stopped(restore_tid);
-		return -1;
-	}
-	pr_info("[timing] pid %d restore: %.0f ms\n", pid, now_ms() - t0);
-
-	t0 = now_ms();
-	if (run_cuda_checkpoint(pid, "unlock") != 0) {
-		pr_err("pid %d: cuda-checkpoint unlock failed\n", pid);
-		interrupt_one_thread(restore_tid, &save_sigset);
-		ptrace_detach_stopped(restore_tid);
-		return -1;
-	}
-	pr_info("[timing] pid %d unlock: %.0f ms\n", pid, now_ms() - t0);
-
-	/* 4. Re-freeze the restore thread */
-	interrupt_one_thread(restore_tid, &save_sigset);
-
-	/*
-	 * Detach the restore thread with SIGSTOP so it stays in T_STOPPED until
-	 * the caller sends SIGCONT to the whole process.
-	 */
-	ptrace_detach_stopped(restore_tid);
 	return 0;
 }
 
@@ -1129,22 +1066,57 @@ int main(int argc, char **argv)
 		free(ckpt_pids);
 
 		/*
-		 * Re-arm timers with the values saved at seize time (op 1).  CRIU
-		 * also re-arms them, but only to the dump-time values; we override
-		 * here so the process sees timers as if no time elapsed across ops 1-4.
+		 * Re-arm timers with the values saved at seize time.  CRIU also
+		 * re-arms them, but only to the dump-time values; we override here
+		 * so the process sees timers as if no time elapsed across the freeze.
 		 */
 		for (i = 0; i < n_pids; i++)
 			restore_timers_for_pid(pids[i], img_dir_fd);
 
 		/*
-		 * Resume the tree in reverse BFS order (deepest children first so
-		 * parents don't race against unready children).  PTRACE_DETACH lets
-		 * the main thread of each process run; SIGCONT resumes any threads
-		 * still in group-stop from criu --leave-stopped.
+		 * Phase 2: Resume the tree in reverse BFS order (deepest children
+		 * first so parents don't race against unready children).
+		 * PTRACE_DETACH lets the main thread run; SIGCONT wakes any threads
+		 * still in group-stop from criu --leave-stopped or our checkpoint.
 		 */
 		for (i = n_pids - 1; i >= 0; i--) {
 			ptrace_detach_resume(pids[i]);
 			kill(pids[i], SIGCONT);
+		}
+
+		/*
+		 * Phase 3: CUDA restore + unlock with processes fully running.
+		 *
+		 * This matches cuda_plugin.c RESUME_DEVICES_LATE behaviour: the
+		 * whole process (all threads) is running when cuda-checkpoint is
+		 * called.  Attempting to resume only the restore thread while the
+		 * main thread stays in ptrace-stop causes cuda-checkpoint to hang,
+		 * because the kernel intercepts the group-stop re-entry as a
+		 * TASK_TRACED event that SIGCONT cannot wake.
+		 *
+		 * Safety: after checkpoint, the CUDA driver keeps the context
+		 * locked.  Any CUDA API calls from the application are deferred by
+		 * the driver until cuda-checkpoint --action unlock completes.
+		 */
+		for (i = 0; i < n_pids; i++) {
+			int restore_tid = get_restore_tid(pids[i]);
+
+			if (restore_tid == -1)
+				continue;
+
+			pr_info("pid %d: CUDA restore (restore_tid=%d)\n",
+				pids[i], restore_tid);
+			if (run_cuda_checkpoint(pids[i], "restore") != 0) {
+				pr_err("pid %d: cuda-checkpoint restore failed\n",
+				       pids[i]);
+				ret = 1;
+				continue;
+			}
+			if (run_cuda_checkpoint(pids[i], "unlock") != 0) {
+				pr_err("pid %d: cuda-checkpoint unlock failed\n",
+				       pids[i]);
+				ret = 1;
+			}
 		}
 
 	} else {
