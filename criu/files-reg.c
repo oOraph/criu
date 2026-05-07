@@ -1411,7 +1411,24 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 		 */
 
 		if (errno == ENOENT) {
-			link_strip_deleted(link);
+			bool deleted = link_strip_deleted(link);
+
+			/*
+			 * The file was renamed away: its path is marked "(deleted)"
+			 * while st_nlink is still >= 1 through another name (e.g.
+			 * glibc's sem_open() creates a temp file and renames it to the
+			 * user-visible name in /dev/shm).  Link-remap fails on restore
+			 * because the container gets a fresh /dev/shm where the
+			 * remapped link is absent.  Without --link-remap, save the
+			 * content as a ghost instead: it is self-contained regardless
+			 * of the restored filesystem.  A path without the suffix (e.g.
+			 * a file hidden by a mount over its directory) is still refused.
+			 */
+			if (deleted && !opts.link_remap_ok && opts.ghost_limit) {
+				pr_info("ghost-dumping renamed-deleted file %s (st_nlink=%lu)\n",
+					rpath + 1, (unsigned long)ost->st_nlink);
+				return dump_ghost_remap(rpath + 1, ost, lfd, id, nsid);
+			}
 			ret = dump_linked_remap(rpath + 1, plen - 1, parms, lfd, id, nsid, &fallback);
 			if (ret < 0 && fallback) {
 				/* fallback is true only if following conditions are true:
