@@ -1412,6 +1412,21 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 
 		if (errno == ENOENT) {
 			link_strip_deleted(link);
+			/*
+			 * The mapped path no longer resolves (e.g. glibc's sem_open()
+			 * creates a temp file, renames it to the user-visible name, so
+			 * the mmap shows the original "(deleted)" name while st_nlink
+			 * is still >= 1 via the user-visible hardlink).  Link-remap
+			 * fails on restore because the container gets a fresh /dev/shm
+			 * where the remapped link is absent.  When ghost_limit is set,
+			 * save the file content as a ghost instead: it is idempotent
+			 * and self-contained regardless of the restored filesystem.
+			 */
+			if (!opts.link_remap_ok && opts.ghost_limit) {
+				pr_info("ghost-dumping renamed-deleted file %s (st_nlink=%lu)\n",
+					rpath + 1, (unsigned long)ost->st_nlink);
+				return dump_ghost_remap(rpath + 1, ost, lfd, id, nsid);
+			}
 			ret = dump_linked_remap(rpath + 1, plen - 1, parms, lfd, id, nsid, &fallback);
 			if (ret < 0 && fallback) {
 				/* fallback is true only if following conditions are true:
