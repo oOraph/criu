@@ -1023,7 +1023,7 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 
 				got = inject_syscall(tid, syscall_addr, SYS_io_getevents,
 						     (long)aio_ctx, (long)batch, (long)batch,
-						     scratch + AIO_SCRATCH_EVT_OFF, 0L);
+						     scratch + AIO_SCRATCH_EVT_OFF, 0L, 0L);
 				if (got != (long)batch) {
 					pr_err("io_getevents: got %ld want %d (region %u offset %llu)\n",
 					       got, batch, i,
