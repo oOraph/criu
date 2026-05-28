@@ -86,9 +86,66 @@
 #define SYS_pread64 17
 #endif
 
+#ifndef SYS_io_setup
+#define SYS_io_setup     206
+#define SYS_io_destroy   207
+#define SYS_io_getevents 208
+#define SYS_io_submit    209
+#endif
+
+#ifndef SYS_munmap
+#define SYS_munmap 11
+#endif
+
 #ifndef O_DIRECT
 #define O_DIRECT 040000 /* Linux x86-64 */
 #endif
+
+/* In-flight reads per io_submit call */
+#define GPU_AIO_WINDOW 32
+
+/*
+ * Scratch layout in the target process for AIO control structures.
+ * Total: 8 + (64 + 8 + 32) * GPU_AIO_WINDOW bytes.
+ *
+ *   [0]                   aio_context_t  (written by io_setup)
+ *   [AIO_SCRATCH_IOCB_OFF]  struct iocb[GPU_AIO_WINDOW]
+ *   [AIO_SCRATCH_IOCBP_OFF] struct iocb *[GPU_AIO_WINDOW]
+ *   [AIO_SCRATCH_EVT_OFF]   struct io_event[GPU_AIO_WINDOW]
+ */
+#define AIO_SCRATCH_IOCB_OFF   8
+#define AIO_SCRATCH_IOCBP_OFF  (8 + 64 * GPU_AIO_WINDOW)
+#define AIO_SCRATCH_EVT_OFF    (AIO_SCRATCH_IOCBP_OFF + 8 * GPU_AIO_WINDOW)
+#define AIO_SCRATCH_SIZE       (AIO_SCRATCH_EVT_OFF + 32 * GPU_AIO_WINDOW)
+
+#define IOCB_CMD_PREAD 0
+
+/* Mirrors struct iocb from <linux/aio_abi.h>; must stay 64 bytes */
+struct gpu_iocb {
+	uint64_t aio_data;
+	uint32_t aio_key;
+	int32_t  aio_rw_flags;
+	uint16_t aio_lio_opcode;
+	int16_t  aio_reqprio;
+	uint32_t aio_fildes;
+	uint64_t aio_buf;
+	uint64_t aio_nbytes;
+	int64_t  aio_offset;
+	uint64_t aio_reserved2;
+	uint32_t aio_flags;
+	uint32_t aio_resfd;
+};
+
+/* Mirrors struct io_event from <linux/aio_abi.h>; must stay 32 bytes */
+struct gpu_io_event {
+	uint64_t data;
+	uint64_t obj;
+	int64_t  res;
+	int64_t  res2;
+};
+
+_Static_assert(sizeof(struct gpu_iocb) == 64, "gpu_iocb layout mismatch");
+_Static_assert(sizeof(struct gpu_io_event) == 32, "gpu_io_event layout mismatch");
 
 #ifndef O_PATH
 #define O_PATH 010000000 /* Linux x86-64 */
@@ -724,6 +781,8 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	uint64_t file_offset, total_bytes = 0;
 	uint32_t i;
 	long target_fd;
+	long scratch;
+	uint64_t aio_ctx;
 	uint64_t path_addr;
 	double t0;
 	int ns_pid = get_ns_pid(pid);
@@ -840,14 +899,48 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	}
 
 	/*
-	 * For each GPU VMA: mlock first to pre-fault all anonymous pages
-	 * (zero-fills them and pins them in RAM), then inject O_DIRECT pread64
-	 * in chunks.  Pre-faulting is the key: without it, get_user_pages()
-	 * inside the O_DIRECT path allocates and zero-fills pages on every DMA
-	 * setup, limiting throughput to ~1.5 GB/s.  With pages already present
-	 * and pinned, get_user_pages() is near-free and the NVMe controller can
-	 * DMA at full sequential read bandwidth (~2.5 GB/s on this instance).
+	 * Allocate a scratch buffer in the target for AIO control structures,
+	 * then call io_setup to create the AIO context.  All GPU region chunks
+	 * are submitted in a single io_submit call per batch (up to
+	 * GPU_AIO_WINDOW = 32 in-flight reads), cutting ptrace round-trips from
+	 * N_chunks down to 2 per batch and letting the kernel schedule reads
+	 * concurrently rather than one blocking pread64 at a time.
+	 *
+	 * Pre-faulting with mlock remains: without pinned pages, get_user_pages()
+	 * inside the O_DIRECT path zeroes and faults on every DMA setup.
 	 */
+	scratch = inject_syscall(tid, syscall_addr, SYS_mmap,
+				 0L, (long)AIO_SCRATCH_SIZE,
+				 PROT_READ | PROT_WRITE,
+				 MAP_PRIVATE | MAP_ANONYMOUS,
+				 -1L, 0L);
+	if ((unsigned long)scratch >= (unsigned long)-4096UL) {
+		pr_err("mmap AIO scratch in target failed: %ld\n", scratch);
+		inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
+		goto out_umount;
+	}
+
+	/* io_setup writes the context handle into scratch[0..7] */
+	if (inject_syscall(tid, syscall_addr, SYS_io_setup,
+			   (long)GPU_AIO_WINDOW, scratch, 0, 0, 0, 0) < 0) {
+		pr_err("io_setup in target failed\n");
+		inject_syscall(tid, syscall_addr, SYS_munmap,
+			       scratch, (long)AIO_SCRATCH_SIZE, 0, 0, 0, 0);
+		inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
+		goto out_umount;
+	}
+
+	aio_ctx = 0;
+	{
+		struct iovec lv = { &aio_ctx, 8 };
+		struct iovec rv = { (void *)(uintptr_t)scratch, 8 };
+
+		if (syscall(SYS_process_vm_readv, (pid_t)tid, &lv, 1UL, &rv, 1UL, 0UL) != 8) {
+			pr_perror("failed to read aio_context_t from target");
+			goto out_aio;
+		}
+	}
+
 	t0 = now_ms();
 	file_offset = GPU_PAGES_DATA_OFFSET;
 	{
@@ -855,9 +948,9 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 		double t1;
 
 		for (i = 0; i < hdr.num_regions; i++) {
-			uint64_t region_done = 0;
+			uint64_t region_offset = 0;
 
-			/* THP hint: use 2MB pages when mlock faults them in (safe: does not set VM_HUGETLB) */
+			/* THP hint: use 2MB pages when mlock faults them in */
 			inject_syscall(tid, syscall_addr, SYS_madvise,
 				       (long)regions[i].start, (long)regions[i].size,
 				       MADV_HUGEPAGE, 0, 0, 0);
@@ -869,42 +962,111 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 			mlock_ms += now_ms() - t1;
 
 			t1 = now_ms();
-			while (region_done < regions[i].size) {
-				uint64_t chunk = regions[i].size - region_done;
-				long n;
+			while (region_offset < regions[i].size) {
+				struct gpu_iocb iocbs[GPU_AIO_WINDOW];
+				uint64_t iocbps[GPU_AIO_WINDOW];
+				int batch = 0;
+				uint64_t batch_bytes = 0;
+				long submitted, got;
+				int j;
 
-				if (chunk > GPU_IO_CHUNK_SIZE)
-					chunk = GPU_IO_CHUNK_SIZE;
+				memset(iocbs, 0, sizeof(iocbs));
 
-				n = inject_syscall(tid, syscall_addr, SYS_pread64,
-						   target_fd,
-						   (long)(regions[i].start + region_done),
-						   (long)chunk,
-						   (long)(file_offset + region_done),
-						   0, 0);
-				if (n <= 0) {
-					pr_err("pread64 injection failed for region %u at offset %llu: %ld\n",
-					       i, (unsigned long long)region_done, n);
-					inject_syscall(tid, syscall_addr, SYS_close,
-						       target_fd, 0, 0, 0, 0, 0);
-					goto out_umount;
+				while (batch < GPU_AIO_WINDOW &&
+				       region_offset + batch_bytes < regions[i].size) {
+					uint64_t off = region_offset + batch_bytes;
+					uint64_t rem = regions[i].size - off;
+					uint64_t chk = rem < GPU_IO_CHUNK_SIZE ? rem : GPU_IO_CHUNK_SIZE;
+
+					iocbs[batch].aio_lio_opcode = IOCB_CMD_PREAD;
+					iocbs[batch].aio_fildes     = (uint32_t)target_fd;
+					iocbs[batch].aio_buf        = regions[i].start + off;
+					iocbs[batch].aio_nbytes     = chk;
+					iocbs[batch].aio_offset     = (int64_t)(file_offset + off);
+					iocbs[batch].aio_data       = (uint64_t)batch;
+					iocbps[batch] = (uint64_t)(scratch + AIO_SCRATCH_IOCB_OFF +
+								   batch * 64);
+
+					batch_bytes += chk;
+					batch++;
 				}
-				region_done  += (uint64_t)n;
-				total_bytes  += (uint64_t)n;
+
+				{
+					struct iovec lv[2] = {
+						{ iocbs,  (size_t)batch * 64 },
+						{ iocbps, (size_t)batch * 8  },
+					};
+					struct iovec rv[2] = {
+						{ (void *)(uintptr_t)(scratch + AIO_SCRATCH_IOCB_OFF),
+						  (size_t)batch * 64 },
+						{ (void *)(uintptr_t)(scratch + AIO_SCRATCH_IOCBP_OFF),
+						  (size_t)batch * 8  },
+					};
+					if (syscall(SYS_process_vm_writev, (pid_t)tid,
+						    lv, 2UL, rv, 2UL, 0UL)
+					    != (ssize_t)(batch * 72)) {
+						pr_perror("process_vm_writev iocbs failed");
+						goto out_aio;
+					}
+				}
+
+				submitted = inject_syscall(tid, syscall_addr, SYS_io_submit,
+							   (long)aio_ctx, (long)batch,
+							   scratch + AIO_SCRATCH_IOCBP_OFF,
+							   0, 0, 0);
+				if (submitted != (long)batch) {
+					pr_err("io_submit: got %ld want %d (region %u offset %llu)\n",
+					       submitted, batch, i,
+					       (unsigned long long)region_offset);
+					goto out_aio;
+				}
+
+				got = inject_syscall(tid, syscall_addr, SYS_io_getevents,
+						     (long)aio_ctx, (long)batch, (long)batch,
+						     scratch + AIO_SCRATCH_EVT_OFF, 0L);
+				if (got != (long)batch) {
+					pr_err("io_getevents: got %ld want %d (region %u offset %llu)\n",
+					       got, batch, i,
+					       (unsigned long long)region_offset);
+					goto out_aio;
+				}
+
+				{
+					struct gpu_io_event evts[GPU_AIO_WINDOW];
+					struct iovec lv = { evts, (size_t)batch * 32 };
+					struct iovec rv = {
+						(void *)(uintptr_t)(scratch + AIO_SCRATCH_EVT_OFF),
+						(size_t)batch * 32
+					};
+
+					if (syscall(SYS_process_vm_readv, (pid_t)tid,
+						    &lv, 1UL, &rv, 1UL, 0UL)
+					    != (ssize_t)(batch * 32)) {
+						pr_perror("process_vm_readv events failed");
+						goto out_aio;
+					}
+					for (j = 0; j < batch; j++) {
+						if (evts[j].res <= 0) {
+							pr_err("AIO event[%d] res=%lld (region %u)\n",
+							       j, (long long)evts[j].res, i);
+							goto out_aio;
+						}
+					}
+				}
+
+				region_offset += batch_bytes;
+				total_bytes   += batch_bytes;
 			}
-			pread_ms += now_ms() - t1;
 
 			/*
 			 * Release VM_LOCKED before cuda-checkpoint restore runs.
-			 * madvise(MADV_DONTNEED) returns EINVAL on VM_LOCKED pages
-			 * (see can_madv_lru_vma()), which breaks the CUDA RM's
-			 * post-restore staging buffer cleanup and leaves the context
-			 * spinning on NV_ESC_RM_CONTROL.  Pages stay warm in RAM
-			 * (recently written) so cuda-checkpoint still reads at full speed.
+			 * madvise(MADV_DONTNEED) returns EINVAL on VM_LOCKED pages,
+			 * which breaks CUDA RM's post-restore staging buffer cleanup.
 			 */
 			inject_syscall(tid, syscall_addr, SYS_munlock,
 				       (long)regions[i].start, (long)regions[i].size,
 				       0, 0, 0, 0);
+			pread_ms += now_ms() - t1;
 
 			file_offset += regions[i].size;
 		}
@@ -912,16 +1074,24 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 		{
 			double total_ms = now_ms() - t0;
 
-			pr_info("[timing] O_DIRECT pread restore: %.0f ms (%.1f GB/s) [mlock=%.0f ms pread=%.0f ms]\n",
+			pr_info("[timing] O_DIRECT AIO restore: %.0f ms (%.1f GB/s) [mlock=%.0f ms aio=%.0f ms]\n",
 				total_ms, (double)total_bytes / total_ms / 1e6,
 				mlock_ms, pread_ms);
 		}
 	}
 
+	inject_syscall(tid, syscall_addr, SYS_io_destroy, (long)aio_ctx, 0, 0, 0, 0, 0);
+	inject_syscall(tid, syscall_addr, SYS_munmap, scratch, (long)AIO_SCRATCH_SIZE, 0, 0, 0, 0);
 	inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
-	pr_info("Loaded %u GPU regions for pid %d via O_DIRECT pread + mlock\n",
+	pr_info("Loaded %u GPU regions for pid %d via O_DIRECT AIO pread + mlock\n",
 		hdr.num_regions, pid);
 	ret = 0;
+	goto out_umount;
+
+out_aio:
+	inject_syscall(tid, syscall_addr, SYS_io_destroy, (long)aio_ctx, 0, 0, 0, 0, 0);
+	inject_syscall(tid, syscall_addr, SYS_munmap, scratch, (long)AIO_SCRATCH_SIZE, 0, 0, 0, 0);
+	inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
 out_umount:
 	umount_in_container(pid, gpu_restore_tmp_path);
 out:
