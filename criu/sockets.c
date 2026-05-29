@@ -429,11 +429,22 @@ static struct socket_desc *sockets[SK_HASH_SIZE];
 struct socket_desc *lookup_socket_ino(unsigned int ino, int family)
 {
 	struct socket_desc *sd;
+	int found = 0;
 
 	pr_debug("Searching for socket %#x family %d\n", ino, family);
 
 	for (sd = sockets[ino % SK_HASH_SIZE]; sd; sd = sd->next) {
 		if (sd->ino == ino) {
+			found++;
+		}
+	}
+
+	for (sd = sockets[ino % SK_HASH_SIZE]; sd; sd = sd->next) {
+		if (sd->ino == ino) {
+			if (found > 1 && sd->state != TCP_LISTEN) {
+				pr_info("skipping socket in state %-16s %#x family %d\n", ___tcp_state_name(sd->state), ino, family);
+				continue;
+			}
 			BUG_ON(sd->family != family);
 			return sd;
 		}

@@ -19,6 +19,7 @@ struct cr_img;
 struct socket_desc {
 	unsigned int family;
 	unsigned int ino;
+	unsigned int state;
 	struct socket_desc *next;
 	struct ns_id *sk_ns;
 	int already_dumped;

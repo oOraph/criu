@@ -675,6 +675,7 @@ int inet_collect_one(struct nlmsghdr *h, int family, int type, struct ns_id *ns)
 	d->src_port = ntohs(m->id.idiag_sport);
 	d->dst_port = ntohs(m->id.idiag_dport);
 	d->state = m->idiag_state;
+	d->sd.state = m->idiag_state;
 	d->rqlen = m->idiag_rqueue;
 	d->wqlen = m->idiag_wqueue;
 	memcpy(d->src_addr, m->id.idiag_src, sizeof(u32) * 4);
