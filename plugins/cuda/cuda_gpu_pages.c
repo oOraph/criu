@@ -723,7 +723,7 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	struct gpu_region *regions = NULL;
 	uint64_t file_offset, total_bytes = 0;
 	uint32_t i;
-	long target_fd;
+	long target_fd, r;
 	uint64_t path_addr;
 	double t0;
 	int ns_pid = get_ns_pid(pid);
@@ -863,10 +863,18 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 				       MADV_HUGEPAGE, 0, 0, 0);
 			/* Pre-fault pages so O_DIRECT DMA doesn't pay fault overhead */
 			t1 = now_ms();
-			inject_syscall(tid, syscall_addr, SYS_mlock,
-				       (long)regions[i].start, (long)regions[i].size,
-				       0, 0, 0, 0);
+			r = inject_syscall(tid, syscall_addr, SYS_mlock,
+					   (long)regions[i].start, (long)regions[i].size,
+					   0, 0, 0, 0);
 			mlock_ms += now_ms() - t1;
+			if (r < 0) {
+				/* Typically -ENOMEM: RLIMIT_MEMLOCK (restored from the image) is
+				 * below the region size. Not fatal: pread faults the pages instead. */
+				pr_warn("mlock(0x%lx, %lu) failed in pid %d: %ld — "
+					"no pre-fault, pages will fault during pread\n",
+					(unsigned long)regions[i].start, (unsigned long)regions[i].size,
+					pid, r);
+			}
 
 			t1 = now_ms();
 			while (region_done < regions[i].size) {
