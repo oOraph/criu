@@ -13,11 +13,12 @@
  *
  * --action restore:
  *   1. ptrace-stop process
- *   2. Inject mmap(MAP_FIXED|MAP_SHARED) from image file over GPU VMAs
- *   3. Inject MADV_POPULATE_READ + mlock to fault pages in
- *   4. ptrace-detach
- *   5. cuda-checkpoint --action restore  (pages -> VRAM)
- *   6. cuda-checkpoint --action unlock
+ *   2. Refill the (empty) GPU VMAs from gpu-pages-<pid>.img by injecting
+ *      openat(O_DIRECT) + per-VMA mlock, pread64 chunks, munlock + close
+ *      (see restore_gpu_pages in cuda_gpu_pages.c)
+ *   3. ptrace-detach
+ *   4. cuda-checkpoint --action restore  (pages -> VRAM)
+ *   5. cuda-checkpoint --action unlock
  *
  * Usage:
  *   cuda-offload --pid PID --dir DIR --action checkpoint
@@ -426,7 +427,7 @@ done:
 }
 
 /*
- * Restore one process: remap GPU pages from image, restore+unlock CUDA.
+ * Restore one process: refill GPU pages from image, restore+unlock CUDA.
  * img_pid is the pid encoded in the image filename (may differ from pid after
  * criu restore).
  */
@@ -446,13 +447,13 @@ static int do_restore_one(int pid, int img_dir_fd, int img_pid)
 		return -1;
 	}
 
-	/* 2. Remap GPU VMAs from the image file */
+	/* 2. Refill GPU VMAs from the image file via injected O_DIRECT pread64 */
 	t0 = now_ms();
 	if (restore_gpu_pages(pid, img_pid, syscall_addr, img_dir_fd) != 0) {
 		ptrace_resume(pid);
 		return -1;
 	}
-	pr_info("[timing] pid %d mmap+mlock: %.0f ms\n", pid, now_ms() - t0);
+	pr_info("[timing] pid %d gpu page restore: %.0f ms\n", pid, now_ms() - t0);
 
 	ptrace_resume(pid);
 

@@ -6,18 +6,27 @@
  *
  * ---- Fast GPU page I/O ----
  *
- * After cuda-checkpoint --action checkpoint, VRAM data is moved into new
- * anonymous private mappings in the target process. These pages would normally
- * go through CRIU's slow ptrace page walk. Instead we:
+ * After the CUDA checkpoint (cuda-checkpoint --action checkpoint or
+ * cuCheckpointProcessCheckpoint), VRAM data is moved into new anonymous
+ * private mappings ("staging VMAs") in the target process. These pages would
+ * normally go through CRIU's slow ptrace page walk. Instead we:
  *
- *   Dump: scan VMAs before/after checkpoint, find new ones, dump them with
- *         process_vm_readv, then free them via injected madvise(MADV_DONTNEED)
- *         so CRIU sees empty pages and skips them.
+ *   Dump: scan /proc/<pid>/maps before/after checkpoint, diff to find the
+ *         new staging VMAs, copy them out with process_vm_readv and write
+ *         gpu-pages-<ns_pid>.img with O_DIRECT, then free them via injected
+ *         madvise(MADV_DONTNEED) so CRIU sees empty pages and skips them.
+ *         The VMAs themselves stay in the address space and CRIU restores
+ *         them as ordinary (empty) anonymous mappings.
  *
- *   Restore: load gpu-pages-<pid>.img into a file-backed mapping, mlock it,
- *            then for each GPU VMA inject mmap(MAP_FIXED|MAP_SHARED) into the
- *            target — zero CPU copy.  cuda-checkpoint restore then reads those
- *            pages and copies back to VRAM.
+ *   Restore: with the target stopped, bind-mount the image into its mount
+ *            namespace, then inject syscalls into one of its threads:
+ *            openat(O_DIRECT), and per staging VMA madvise(MADV_HUGEPAGE),
+ *            mlock (pre-fault + pin so the DMA target pages exist), pread64
+ *            in GPU_IO_CHUNK_SIZE chunks straight into the VMA, munlock (so
+ *            the CUDA RM's later MADV_DONTNEED cleanup is not refused on
+ *            VM_LOCKED pages), and finally close.  The backend's CUDA
+ *            restore then reads the refilled pages back into VRAM.  Falls
+ *            back to buffered reads when the filesystem rejects O_DIRECT.
  */
 
 #ifndef CUDA_GPU_PAGES_H
@@ -27,7 +36,7 @@
 
 #define GPU_PAGES_MAGIC		0x47505544u  /* "GPUD" */
 #define GPU_IO_CHUNK_SIZE	(64 * 1024 * 1024)
-/* Page data starts at this offset in the image file (page-aligned for mmap) */
+/* Page data starts at this offset in the image file (page-aligned for O_DIRECT) */
 #define GPU_PAGES_DATA_OFFSET	4096
 
 struct gpu_region {
