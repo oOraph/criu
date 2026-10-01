@@ -20,13 +20,13 @@
  *
  *   Restore: with the target stopped, bind-mount the image into its mount
  *            namespace, then inject syscalls into one of its threads:
- *            openat(O_DIRECT), and per staging VMA madvise(MADV_HUGEPAGE),
- *            mlock (pre-fault + pin so the DMA target pages exist), pread64
- *            in GPU_IO_CHUNK_SIZE chunks straight into the VMA, munlock (so
- *            the CUDA RM's later MADV_DONTNEED cleanup is not refused on
- *            VM_LOCKED pages), and finally close.  The backend's CUDA
- *            restore then reads the refilled pages back into VRAM.  Falls
- *            back to buffered reads when the filesystem rejects O_DIRECT.
+ *            openat(O_DIRECT), and per staging VMA madvise(MADV_HUGEPAGE)
+ *            then pread64 in GPU_IO_CHUNK_SIZE chunks straight into the VMA
+ *            (the pages fault in as 2 MB THP inside the O_DIRECT path; no
+ *            mlock pre-fault, see cuda_gpu_pages.c), and finally close.  The
+ *            backend's CUDA restore then reads the refilled pages back into
+ *            VRAM.  Falls back to buffered reads when the filesystem rejects
+ *            O_DIRECT.
  */
 
 #ifndef CUDA_GPU_PAGES_H

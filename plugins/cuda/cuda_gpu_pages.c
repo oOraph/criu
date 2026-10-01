@@ -66,14 +66,6 @@
 #define SYS_process_vm_writev 311
 #endif
 
-#ifndef SYS_mlock
-#define SYS_mlock 149
-#endif
-
-#ifndef SYS_munlock
-#define SYS_munlock 150
-#endif
-
 #ifndef SYS_mmap
 #define SYS_mmap 9
 #endif
@@ -695,14 +687,22 @@ static void umount_in_container(int pid, const char *dst)
  * O_DIRECT pread64 calls directly into the target's existing anonymous VMAs.
  *
  * O_DIRECT programs the NVMe controller to DMA data straight into the
- * target's physical pages — no page cache, no intermediate copy, no per-page
- * fault overhead.  Expected throughput: ~3 GB/s (raw NVMe sequential read).
+ * target's physical pages — no page cache, no intermediate copy.  Expected
+ * throughput: raw NVMe sequential read (~3 GB/s on a single drive).
  *
  * For each GPU VMA we inject:
  *   openat(O_RDONLY|O_DIRECT)            — once, reused across regions
+ *   madvise(vma_addr, size, MADV_HUGEPAGE) — THP so the pages fault in 2 MB units
  *   pread64(fd, vma_addr, chunk, offset)  — N chunks per region
- *   mlock(vma_addr, size)                — pin pages for cuda-checkpoint DMA
  *   close(fd)                            — once at the end
+ *
+ * The destination pages are faulted in by get_user_pages() inside the
+ * O_DIRECT path.  With THP that costs ~1 s per 15 GB (measured ~17 GB/s
+ * fault+zero rate); an explicit mlock() pre-fault was measured to be a net
+ * loss (+0.35 s on 14.7 GB, A10G/NVMe, 2026-10) and additionally required
+ * RLIMIT_MEMLOCK >= region size (CRIU restores the dumped rlimit, default
+ * 8 MB, so in practice it never ran) and a munlock() before the CUDA
+ * driver's post-restore MADV_DONTNEED cleanup.  Hence no mlock here.
  *
  * O_DIRECT alignment requirements (all guaranteed):
  *   buffer: VMA addresses are page-aligned (4096)
@@ -723,7 +723,7 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	struct gpu_region *regions = NULL;
 	uint64_t file_offset, total_bytes = 0;
 	uint32_t i;
-	long target_fd, r;
+	long target_fd;
 	uint64_t path_addr;
 	double t0;
 	int ns_pid = get_ns_pid(pid);
@@ -840,41 +840,23 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	}
 
 	/*
-	 * For each GPU VMA: mlock first to pre-fault all anonymous pages
-	 * (zero-fills them and pins them in RAM), then inject O_DIRECT pread64
-	 * in chunks.  Pre-faulting is the key: without it, get_user_pages()
-	 * inside the O_DIRECT path allocates and zero-fills pages on every DMA
-	 * setup, limiting throughput to ~1.5 GB/s.  With pages already present
-	 * and pinned, get_user_pages() is near-free and the NVMe controller can
-	 * DMA at full sequential read bandwidth (~2.5 GB/s on this instance).
+	 * For each GPU VMA: THP hint, then inject O_DIRECT pread64 in chunks.
+	 * The pages are faulted in (2 MB THP) by get_user_pages() inside the
+	 * O_DIRECT path; see the header comment for why there is no mlock().
 	 */
 	t0 = now_ms();
 	file_offset = GPU_PAGES_DATA_OFFSET;
 	{
-		double mlock_ms = 0, pread_ms = 0;
+		double pread_ms = 0;
 		double t1;
 
 		for (i = 0; i < hdr.num_regions; i++) {
 			uint64_t region_done = 0;
 
-			/* THP hint: use 2MB pages when mlock faults them in (safe: does not set VM_HUGETLB) */
+			/* THP hint: fault in 2MB pages (safe: does not set VM_HUGETLB) */
 			inject_syscall(tid, syscall_addr, SYS_madvise,
 				       (long)regions[i].start, (long)regions[i].size,
 				       MADV_HUGEPAGE, 0, 0, 0);
-			/* Pre-fault pages so O_DIRECT DMA doesn't pay fault overhead */
-			t1 = now_ms();
-			r = inject_syscall(tid, syscall_addr, SYS_mlock,
-					   (long)regions[i].start, (long)regions[i].size,
-					   0, 0, 0, 0);
-			mlock_ms += now_ms() - t1;
-			if (r < 0) {
-				/* Typically -ENOMEM: RLIMIT_MEMLOCK (restored from the image) is
-				 * below the region size. Not fatal: pread faults the pages instead. */
-				pr_warn("mlock(0x%lx, %lu) failed in pid %d: %ld — "
-					"no pre-fault, pages will fault during pread\n",
-					(unsigned long)regions[i].start, (unsigned long)regions[i].size,
-					pid, r);
-			}
 
 			t1 = now_ms();
 			while (region_done < regions[i].size) {
@@ -902,32 +884,19 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 			}
 			pread_ms += now_ms() - t1;
 
-			/*
-			 * Release VM_LOCKED before cuda-checkpoint restore runs.
-			 * madvise(MADV_DONTNEED) returns EINVAL on VM_LOCKED pages
-			 * (see can_madv_lru_vma()), which breaks the CUDA RM's
-			 * post-restore staging buffer cleanup and leaves the context
-			 * spinning on NV_ESC_RM_CONTROL.  Pages stay warm in RAM
-			 * (recently written) so cuda-checkpoint still reads at full speed.
-			 */
-			inject_syscall(tid, syscall_addr, SYS_munlock,
-				       (long)regions[i].start, (long)regions[i].size,
-				       0, 0, 0, 0);
-
 			file_offset += regions[i].size;
 		}
 
 		{
 			double total_ms = now_ms() - t0;
 
-			pr_info("[timing] O_DIRECT pread restore: %.0f ms (%.1f GB/s) [mlock=%.0f ms pread=%.0f ms]\n",
-				total_ms, (double)total_bytes / total_ms / 1e6,
-				mlock_ms, pread_ms);
+			pr_info("[timing] O_DIRECT pread restore: %.0f ms (%.1f GB/s) [pread=%.0f ms]\n",
+				total_ms, (double)total_bytes / total_ms / 1e6, pread_ms);
 		}
 	}
 
 	inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
-	pr_info("Loaded %u GPU regions for pid %d via O_DIRECT pread + mlock\n",
+	pr_info("Loaded %u GPU regions for pid %d via O_DIRECT pread\n",
 		hdr.num_regions, pid);
 	ret = 0;
 out_umount:

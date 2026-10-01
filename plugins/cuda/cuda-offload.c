@@ -14,7 +14,7 @@
  * --action restore:
  *   1. ptrace-stop process
  *   2. Refill the (empty) GPU VMAs from gpu-pages-<pid>.img by injecting
- *      openat(O_DIRECT) + per-VMA mlock, pread64 chunks, munlock + close
+ *      openat(O_DIRECT) + per-VMA madvise(MADV_HUGEPAGE), pread64 chunks, close
  *      (see restore_gpu_pages in cuda_gpu_pages.c)
  *   3. ptrace-detach
  *   4. cuda-checkpoint --action restore  (pages -> VRAM)
