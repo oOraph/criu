@@ -33,7 +33,7 @@ cuda_plugin.so: $(PLUGIN_SRCS) $(PLUGIN_HEADERS)
 # Standalone tool: built without -DBUILD_FOR_CRIU_PLUGIN so pr_* goes to stderr.
 $(OFFLOAD_BIN): cuda-offload.c cuda_gpu_pages.c cuda_gpu_pages.h
 	$(call msg-gen, $@)
-	$(Q) $(CC) -g -Wall -Werror cuda-offload.c cuda_gpu_pages.c -o $@
+	$(Q) $(CC) -g -Wall -Werror -pthread cuda-offload.c cuda_gpu_pages.c -o $@
 
 clean:
 	$(call msg-clean, $@)

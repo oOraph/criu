@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -544,187 +546,134 @@ int release_gpu_pages(int tid, uint64_t syscall_addr, struct gpu_region *regions
 }
 
 /*
- * Enter pid's mount namespace, bind mount src (host absolute path) to dst
- * (a path inside the container, e.g. /tmp/.criu-gpu-restore.img), then
- * return to the original mount namespace.
+ * Parallel page-fill worker.
  *
- * The destination file is created via /proc/<pid>/root<dst> before the
- * setns so the bind mount has a target to attach to.
+ * The serial pre-fault (injected mlock) was the restore bottleneck: faulting
+ * and zero-filling the target's anonymous pages single-threaded ran at
+ * ~5 GB/s, far below both the NVMe array and the kernel's parallel fault
+ * throughput.  The O_DIRECT read itself was never the bottleneck (it already
+ * hit full array bandwidth).
  *
- * This works as long as the host filesystem path 'src' is accessible from
- * within the container's mount namespace.  For non-preserved-namespace
- * scenarios see the BFS fallback note in get_ns_pid().
+ * Instead we fan the work out across N plugin threads.  Each thread pulls
+ * fixed-size chunks from a shared queue, reads each chunk from the image file
+ * (O_DIRECT when supported) into a private aligned bounce buffer, then writes
+ * it into the target's existing anonymous VMAs with process_vm_writev.  The
+ * cross-process write faults the target pages in parallel — anonymous write
+ * faults scale near-linearly with threads on modern kernels (split page-table
+ * locks) — and fills them with the real data in one pass.  No injected
+ * syscalls are needed for the data path, so the bind-mount dance and the
+ * serial mlock/pread/munlock are all gone.
+ *
+ * process_madvise(MADV_POPULATE_WRITE) would be a cleaner fault trigger but is
+ * rejected (EINVAL) cross-process by the kernel allowlist on 6.12, so we drive
+ * the faulting via process_vm_writev, which is permitted and also delivers the
+ * data.  The pages are left present and warm (not locked); cuda-checkpoint
+ * reads them back to VRAM.
  */
-/*
- * Bind mount 'src' (host absolute path) to 'dst' inside the container's
- * mount namespace, using the same open_tree + move_mount pattern that CRIU
- * uses in do_mount_in_right_mntns() (criu/mount-v2.c).
- *
- * open_tree(OPEN_TREE_CLONE) captures a detached anonymous mount of 'src'
- * while still in the host namespace — the source path does not need to be
- * accessible from inside the container.  After setns into the container's
- * mount namespace, move_mount attaches the detached mount at 'dst'.
- */
-static int bind_mount_in_container(int pid, const char *src, const char *dst)
+struct gpu_chunk {
+	uint64_t target_addr;
+	uint64_t file_offset;
+	uint64_t len;
+};
+
+struct gpu_restore_ctx {
+	int pid;
+	int data_fd;
+	struct gpu_chunk *chunks;
+	int n_chunks;
+	_Atomic int next;
+	_Atomic int err;
+};
+
+static void *gpu_restore_worker(void *arg)
 {
-	char proc_dst[PATH_MAX];
-	char ns_path[64];
-	int tree_fd = -1, saved_mns_fd = -1, container_mns_fd = -1, cwd_fd = -1;
-	int fd, ret = -1;
+	struct gpu_restore_ctx *c = arg;
+	void *buf = NULL;
+	int i;
 
-	/* Capture a detached clone of src's mount in the host namespace. */
-	tree_fd = (int)syscall(SYS_open_tree, AT_FDCWD, src,
-			       OPEN_TREE_CLONE | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW);
-	if (tree_fd < 0) {
-		pr_perror("open_tree %s failed", src);
-		return -1;
+	if (posix_memalign(&buf, 4096, GPU_IO_CHUNK_SIZE) != 0) {
+		atomic_store(&c->err, ENOMEM);
+		return NULL;
 	}
 
-	/* Create the destination file inside the container's rootfs. */
-	snprintf(proc_dst, sizeof(proc_dst), "/proc/%d/root%s", pid, dst);
-	fd = open(proc_dst, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-	if (fd < 0) {
-		pr_perror("Cannot create bind mount destination %s", proc_dst);
-		goto out;
-	}
-	close(fd);
+	while ((i = atomic_fetch_add(&c->next, 1)) < c->n_chunks) {
+		struct gpu_chunk *ch = &c->chunks[i];
+		uint64_t rdone = 0, wdone = 0;
 
-	saved_mns_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
-	if (saved_mns_fd < 0) {
-		pr_perror("Cannot open /proc/self/ns/mnt");
-		goto out;
-	}
+		/* Read the whole chunk first so O_DIRECT offsets stay aligned. */
+		while (rdone < ch->len) {
+			ssize_t n = pread(c->data_fd, (char *)buf + rdone,
+					  (size_t)(ch->len - rdone),
+					  (off_t)(ch->file_offset + rdone));
+			if (n <= 0) {
+				atomic_store(&c->err, errno ? errno : EIO);
+				goto out;
+			}
+			rdone += (uint64_t)n;
+		}
 
-	/*
-	 * Save CWD before entering the container namespace.  The container's
-	 * mnt ns may not contain the host work directory, leaving the CWD
-	 * detached after setns; fchdir restores it on the way back so that
-	 * CRIU's relative paths (e.g. .criu.cgyard.*) remain resolvable.
-	 */
-	cwd_fd = open(".", O_PATH | O_DIRECTORY);
-	if (cwd_fd < 0) {
-		pr_perror("Cannot open current directory");
-		goto out;
-	}
-
-	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
-	container_mns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
-	if (container_mns_fd < 0) {
-		pr_perror("Cannot open container mount namespace %s", ns_path);
-		goto out;
-	}
-
-	if (syscall(SYS_setns, container_mns_fd, CLONE_NEWNS) < 0) {
-		pr_perror("setns to container mount namespace failed");
-		goto out;
-	}
-
-	if (syscall(SYS_move_mount, tree_fd, "", AT_FDCWD, dst,
-		    MOVE_MOUNT_F_EMPTY_PATH) < 0)
-		pr_perror("move_mount %s -> %s failed", src, dst);
-	else
-		ret = 0;
-
-	if (syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS) < 0) {
-		pr_perror("setns back to host mount namespace failed");
-		ret = -1;
-	} else if (fchdir(cwd_fd) < 0) {
-		pr_perror("fchdir to restore working directory failed");
-		ret = -1;
+		/* Fault + fill the target's pages (parallel across threads). */
+		while (wdone < ch->len) {
+			struct iovec liov = { .iov_base = (char *)buf + wdone,
+					      .iov_len = (size_t)(ch->len - wdone) };
+			struct iovec riov = { .iov_base = (void *)(uintptr_t)(ch->target_addr + wdone),
+					      .iov_len = (size_t)(ch->len - wdone) };
+			ssize_t w = (ssize_t)syscall(SYS_process_vm_writev, (pid_t)c->pid,
+						     &liov, 1UL, &riov, 1UL, 0UL);
+			if (w <= 0) {
+				atomic_store(&c->err, errno ? errno : EIO);
+				goto out;
+			}
+			wdone += (uint64_t)w;
+		}
 	}
 out:
-	if (tree_fd >= 0)
-		close(tree_fd);
-	if (saved_mns_fd >= 0)
-		close(saved_mns_fd);
-	if (container_mns_fd >= 0)
-		close(container_mns_fd);
-	if (cwd_fd >= 0)
-		close(cwd_fd);
-	return ret;
+	free(buf);
+	return NULL;
 }
 
-static void umount_in_container(int pid, const char *dst)
+static int gpu_restore_thread_count(void)
 {
-	char ns_path[64];
-	int saved_mns_fd, container_mns_fd, cwd_fd;
+	const char *env = getenv("CUDA_RESTORE_THREADS");
+	int n = 8;
 
-	saved_mns_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
-	if (saved_mns_fd < 0)
-		return;
-
-	cwd_fd = open(".", O_PATH | O_DIRECTORY);
-	if (cwd_fd < 0) {
-		close(saved_mns_fd);
-		return;
+	if (env && *env) {
+		n = atoi(env);
+		if (n < 1)
+			n = 1;
 	}
-
-	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
-	container_mns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
-	if (container_mns_fd < 0) {
-		close(saved_mns_fd);
-		close(cwd_fd);
-		return;
-	}
-
-	if (syscall(SYS_setns, container_mns_fd, CLONE_NEWNS) == 0) {
-		syscall(SYS_umount2, dst, MNT_DETACH);
-		if (syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS) < 0)
-			pr_perror("setns back to host mount namespace failed in umount");
-		else if (fchdir(cwd_fd) < 0)
-			pr_perror("fchdir to restore working directory failed in umount");
-	}
-	close(container_mns_fd);
-	close(saved_mns_fd);
-	close(cwd_fd);
+	if (n > 32)
+		n = 32;
+	return n;
 }
 
 /*
- * Restore GPU pages into the target process via injected O_DIRECT pread64.
+ * Restore GPU pages into the target process.
  *
- * Instead of mmap(MAP_SHARED)+MADV_POPULATE_READ (which reads through the
- * page cache at ~1.5 GB/s due to per-page kernel overhead), we inject
- * O_DIRECT pread64 calls directly into the target's existing anonymous VMAs.
+ * Reads gpu-pages-<ns_pid>.img and fills the target's anonymous GPU VMAs in
+ * parallel via process_vm_writev (see gpu_restore_worker).  An injected
+ * MADV_HUGEPAGE per region first hints 2MB THP for the about-to-be-faulted
+ * pages.  On return the pages are present and warm (not locked); the caller's
+ * cuda-checkpoint restore reads them back to VRAM.
  *
- * O_DIRECT programs the NVMe controller to DMA data straight into the
- * target's physical pages — no page cache, no intermediate copy.  Expected
- * throughput: raw NVMe sequential read (~3 GB/s on a single drive).
- *
- * For each GPU VMA we inject:
- *   openat(O_RDONLY|O_DIRECT)            — once, reused across regions
- *   madvise(vma_addr, size, MADV_HUGEPAGE) — THP so the pages fault in 2 MB units
- *   pread64(fd, vma_addr, chunk, offset)  — N chunks per region
- *   close(fd)                            — once at the end
- *
- * The destination pages are faulted in by get_user_pages() inside the
- * O_DIRECT path.  With THP that costs ~1 s per 15 GB (measured ~17 GB/s
- * fault+zero rate); an explicit mlock() pre-fault was measured to be a net
- * loss (+0.35 s on 14.7 GB, A10G/NVMe, 2026-10) and additionally required
- * RLIMIT_MEMLOCK >= region size (CRIU restores the dumped rlimit, default
- * 8 MB, so in practice it never ran) and a munlock() before the CUDA
- * driver's post-restore MADV_DONTNEED cleanup.  Hence no mlock here.
- *
- * O_DIRECT alignment requirements (all guaranteed):
- *   buffer: VMA addresses are page-aligned (4096)
- *   count:  region sizes are page multiples; chunk = GPU_IO_CHUNK_SIZE (64 MB)
- *   offset: GPU_PAGES_DATA_OFFSET = 4096; all region offsets are page multiples
- *
- * If O_DIRECT is not supported (EINVAL), fall back to plain O_RDONLY so the
- * injection still works (at page-cache speed, same as the old mmap approach).
+ * O_DIRECT is used for the image reads when the filesystem supports it (full
+ * NVMe bandwidth, no page-cache pollution); otherwise buffered reads.
+ * O_DIRECT alignment holds: region sizes are page multiples,
+ * GPU_PAGES_DATA_OFFSET and GPU_IO_CHUNK_SIZE are page multiples, and the
+ * bounce buffer is posix_memalign'd to 4096.
  */
 int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 {
 	char fname[64];
-	char img_dir_path[PATH_MAX - 64];
-	char file_path[PATH_MAX];
-	char proc_link[64];
-	int img_fd = -1, ret = -1;
+	int img_fd = -1, data_fd = -1, ret = -1;
 	struct gpu_pages_hdr hdr;
 	struct gpu_region *regions = NULL;
-	uint64_t file_offset, total_bytes = 0;
-	uint32_t i;
-	long target_fd;
-	uint64_t path_addr;
+	struct gpu_chunk *chunks = NULL;
+	struct gpu_restore_ctx ctx;
+	pthread_t threads[32];
+	uint64_t fbase, total_bytes = 0;
+	int n_threads, started = 0, i, direct = 1, cap = 0, nc = 0;
+	uint32_t r;
 	double t0;
 	int ns_pid = get_ns_pid(pid);
 
@@ -765,144 +714,111 @@ int restore_gpu_pages(int pid, int tid, uint64_t syscall_addr, int img_dir_fd)
 	img_fd = -1;
 
 	/*
-	 * Resolve the host absolute path of the image file, then bind mount it
-	 * into the container's mount namespace at a per-pid well-known path.
-	 * The target process runs in the container's mount namespace and cannot
-	 * see /var/lib/zeropod/... directly, so injecting openat with the host
-	 * path yields ENOENT.  The bind mount makes the file visible at a path
-	 * the target can open.  Use ns_pid in the name to avoid collisions when
-	 * multiple pids in the same tree are restored concurrently.
+	 * Hint THP per region, and slice all regions into a flat chunk
+	 * work-list.  Slicing within regions (not just one chunk per region) is
+	 * what lets a single huge VMA be filled by all threads at once.
 	 */
-	char gpu_restore_tmp_path[64];
-	snprintf(gpu_restore_tmp_path, sizeof(gpu_restore_tmp_path),
-		 "/tmp/.criu-gpu-restore-%d.img", ns_pid);
+	fbase = GPU_PAGES_DATA_OFFSET;
+	for (r = 0; r < hdr.num_regions; r++) {
+		uint64_t off = 0;
 
-	snprintf(proc_link, sizeof(proc_link), "/proc/self/fd/%d", img_dir_fd);
-	{
-		ssize_t n = readlink(proc_link, img_dir_path, sizeof(img_dir_path) - 1);
+		total_bytes += regions[r].size;
+		if (syscall_addr)
+			inject_syscall(tid, syscall_addr, SYS_madvise,
+				       (long)regions[r].start, (long)regions[r].size,
+				       MADV_HUGEPAGE, 0, 0, 0);
 
-		if (n < 0) {
-			pr_perror("readlink %s failed", proc_link);
-			goto out;
+		while (off < regions[r].size) {
+			uint64_t len = regions[r].size - off;
+
+			if (len > GPU_IO_CHUNK_SIZE)
+				len = GPU_IO_CHUNK_SIZE;
+			if (nc >= cap) {
+				int ncap = cap ? cap * 2 : 64;
+				struct gpu_chunk *tmp = realloc(chunks, (size_t)ncap * sizeof(*chunks));
+
+				if (!tmp) {
+					pr_err("OOM building chunk list\n");
+					goto out;
+				}
+				chunks = tmp;
+				cap = ncap;
+			}
+			chunks[nc].target_addr = regions[r].start + off;
+			chunks[nc].file_offset = fbase + off;
+			chunks[nc].len = len;
+			nc++;
+			off += len;
 		}
-		img_dir_path[n] = '\0';
-	}
-	snprintf(file_path, sizeof(file_path), "%s/%s", img_dir_path, fname);
-	pr_info("GPU pages host path: %s\n", file_path);
-
-	if (bind_mount_in_container(pid, file_path, gpu_restore_tmp_path) < 0) {
-		pr_err("Failed to bind mount gpu-pages file into container\n");
-		goto out;
-	}
-
-	/* Write the container-side path into the target's stack. */
-	{
-		struct user_regs_struct regs;
-		struct iovec local_iov, remote_iov;
-		const char *inject_path = gpu_restore_tmp_path;
-		size_t path_len = strlen(inject_path) + 1;
-
-		if (ptrace(PTRACE_GETREGS, tid, NULL, &regs) < 0) {
-			pr_perror("PTRACE_GETREGS failed");
-			goto out_umount;
-		}
-		path_addr = regs.rsp - 256;
-
-		local_iov.iov_base = (void *)inject_path;
-		local_iov.iov_len = path_len;
-		remote_iov.iov_base = (void *)(uintptr_t)path_addr;
-		remote_iov.iov_len = path_len;
-		if (syscall(SYS_process_vm_writev, (pid_t)tid, &local_iov, 1UL,
-			    &remote_iov, 1UL, 0UL) != (ssize_t)path_len) {
-			pr_perror("process_vm_writev path failed");
-			goto out_umount;
-		}
-
-		/*
-		 * Try O_DIRECT first.  If the filesystem rejects it (EINVAL),
-		 * fall back to buffered I/O — the pread loop below works either
-		 * way, just at page-cache speed instead of NVMe DMA speed.
-		 */
-		target_fd = inject_syscall(tid, syscall_addr, SYS_openat,
-					   (long)AT_FDCWD, (long)path_addr,
-					   O_RDONLY | O_DIRECT, 0, 0, 0);
-		if (target_fd == -EINVAL) {
-			pr_info("O_DIRECT not supported, falling back to buffered I/O\n");
-			target_fd = inject_syscall(tid, syscall_addr, SYS_openat,
-						   (long)AT_FDCWD, (long)path_addr,
-						   O_RDONLY, 0, 0, 0);
-		}
-	}
-
-	if (target_fd < 0) {
-		pr_err("openat injection failed: %ld\n", target_fd);
-		goto out_umount;
+		fbase += regions[r].size;
 	}
 
 	/*
-	 * For each GPU VMA: THP hint, then inject O_DIRECT pread64 in chunks.
-	 * The pages are faulted in (2 MB THP) by get_user_pages() inside the
-	 * O_DIRECT path; see the header comment for why there is no mlock().
+	 * Try O_DIRECT; on EINVAL (filesystem doesn't support it) fall back to
+	 * buffered reads.  The plugin opens the image itself, so the target
+	 * never needs the file visible in its mount namespace.
 	 */
-	t0 = now_ms();
-	file_offset = GPU_PAGES_DATA_OFFSET;
-	{
-		double pread_ms = 0;
-		double t1;
-
-		for (i = 0; i < hdr.num_regions; i++) {
-			uint64_t region_done = 0;
-
-			/* THP hint: fault in 2MB pages (safe: does not set VM_HUGETLB) */
-			inject_syscall(tid, syscall_addr, SYS_madvise,
-				       (long)regions[i].start, (long)regions[i].size,
-				       MADV_HUGEPAGE, 0, 0, 0);
-
-			t1 = now_ms();
-			while (region_done < regions[i].size) {
-				uint64_t chunk = regions[i].size - region_done;
-				long n;
-
-				if (chunk > GPU_IO_CHUNK_SIZE)
-					chunk = GPU_IO_CHUNK_SIZE;
-
-				n = inject_syscall(tid, syscall_addr, SYS_pread64,
-						   target_fd,
-						   (long)(regions[i].start + region_done),
-						   (long)chunk,
-						   (long)(file_offset + region_done),
-						   0, 0);
-				if (n <= 0) {
-					pr_err("pread64 injection failed for region %u at offset %llu: %ld\n",
-					       i, (unsigned long long)region_done, n);
-					inject_syscall(tid, syscall_addr, SYS_close,
-						       target_fd, 0, 0, 0, 0, 0);
-					goto out_umount;
-				}
-				region_done  += (uint64_t)n;
-				total_bytes  += (uint64_t)n;
-			}
-			pread_ms += now_ms() - t1;
-
-			file_offset += regions[i].size;
+	data_fd = openat(img_dir_fd, fname, O_RDONLY | O_DIRECT);
+	if (data_fd < 0) {
+		if (errno != EINVAL) {
+			pr_perror("Cannot open %s for data", fname);
+			goto out;
 		}
-
-		{
-			double total_ms = now_ms() - t0;
-
-			pr_info("[timing] O_DIRECT pread restore: %.0f ms (%.1f GB/s) [pread=%.0f ms]\n",
-				total_ms, (double)total_bytes / total_ms / 1e6, pread_ms);
+		direct = 0;
+		data_fd = openat(img_dir_fd, fname, O_RDONLY);
+		if (data_fd < 0) {
+			pr_perror("Cannot open %s (buffered)", fname);
+			goto out;
 		}
+		pr_info("O_DIRECT not supported, using buffered reads\n");
 	}
 
-	inject_syscall(tid, syscall_addr, SYS_close, target_fd, 0, 0, 0, 0, 0);
-	pr_info("Loaded %u GPU regions for pid %d via O_DIRECT pread\n",
+	ctx.pid = pid;
+	ctx.data_fd = data_fd;
+	ctx.chunks = chunks;
+	ctx.n_chunks = nc;
+	atomic_init(&ctx.next, 0);
+	atomic_init(&ctx.err, 0);
+
+	n_threads = gpu_restore_thread_count();
+	if (n_threads > nc)
+		n_threads = nc;
+
+	t0 = now_ms();
+	for (i = 0; i < n_threads; i++) {
+		if (pthread_create(&threads[i], NULL, gpu_restore_worker, &ctx) != 0) {
+			pr_perror("pthread_create failed");
+			break;
+		}
+		started++;
+	}
+	if (started == 0)
+		gpu_restore_worker(&ctx); /* fall back to inline single-threaded */
+	else
+		for (i = 0; i < started; i++)
+			pthread_join(threads[i], NULL);
+
+	if (atomic_load(&ctx.err) != 0) {
+		errno = atomic_load(&ctx.err);
+		pr_perror("GPU page restore failed");
+		goto out;
+	}
+
+	{
+		double ms = now_ms() - t0;
+
+		pr_info("[timing] parallel restore: %.0f ms (%.1f GB/s) [%d threads, %d chunks, %s]\n",
+			ms, (double)total_bytes / ms / 1e6, started ? started : 1, nc,
+			direct ? "O_DIRECT" : "buffered");
+	}
+	pr_info("Loaded %u GPU regions for pid %d via parallel process_vm_writev\n",
 		hdr.num_regions, pid);
 	ret = 0;
-out_umount:
-	umount_in_container(pid, gpu_restore_tmp_path);
 out:
+	free(chunks);
 	free(regions);
+	if (data_fd >= 0)
+		close(data_fd);
 	if (img_fd >= 0)
 		close(img_fd);
 	return ret;
