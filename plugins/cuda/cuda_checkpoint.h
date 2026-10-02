@@ -18,8 +18,8 @@
 
 typedef int CUresult;
 
-#define CUDA_SUCCESS		 0
-#define CUDA_ERROR_INVALID_VALUE 1
+#define CUDA_SUCCESS		   0
+#define CUDA_ERROR_INVALID_VALUE   1
 #define CUDA_ERROR_NOT_INITIALIZED 3
 
 /* The direct backend uses the CUDA 13.0 checkpoint ABI shipped by r580+. */
@@ -38,8 +38,12 @@ typedef struct {
 	unsigned long long reserved1[7];
 } CUcheckpointLockArgs;
 
+struct CUcheckpointCustomStorageInfo_st;
+
 typedef struct {
-	unsigned long long reserved[8];
+	/* CUDA 13.4: when non-NULL the driver maps GPU memory into the caller instead of staging it in the target */
+	struct CUcheckpointCustomStorageInfo_st **customStorageInfo_out;
+	char reserved[64 - sizeof(void *)];
 } CUcheckpointCheckpointArgs;
 
 typedef struct {
@@ -50,8 +54,10 @@ typedef struct {
 typedef struct {
 	CUcheckpointGpuPair *gpuPairs;
 	unsigned int gpuPairsCount;
-	char reserved[52 - sizeof(CUcheckpointGpuPair *)];
-	unsigned long long reserved1;
+	unsigned int padding0;
+	/* CUDA 13.4: when non-NULL the driver maps the GPU memory to restore into the caller */
+	struct CUcheckpointCustomStorageInfo_st **customStorageInfo_out;
+	char reserved[64 - sizeof(CUcheckpointGpuPair *) - 2 * sizeof(unsigned int) - sizeof(void *)];
 } CUcheckpointRestoreArgs;
 
 typedef struct {
@@ -83,5 +89,12 @@ _Static_assert(offsetof(CUcheckpointRestoreArgs, gpuPairs) == 0,
 	       "CUcheckpointRestoreArgs.gpuPairs has an unexpected offset");
 _Static_assert(offsetof(CUcheckpointRestoreArgs, gpuPairsCount) == sizeof(void *),
 	       "CUcheckpointRestoreArgs.gpuPairsCount has an unexpected offset");
+_Static_assert(offsetof(CUcheckpointCheckpointArgs, customStorageInfo_out) == 0,
+	       "CUcheckpointCheckpointArgs.customStorageInfo_out has an unexpected offset");
+/* The driver ABI (x86_64); CUDA checkpointing has no 32-bit ABI to match. */
+#if __SIZEOF_POINTER__ == 8
+_Static_assert(offsetof(CUcheckpointRestoreArgs, customStorageInfo_out) == 16,
+	       "CUcheckpointRestoreArgs.customStorageInfo_out has an unexpected offset");
+#endif
 
 #endif /* CUDA_CHECKPOINT_H */
