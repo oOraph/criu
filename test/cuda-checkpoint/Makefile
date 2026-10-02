@@ -45,12 +45,12 @@ cuda-device-map-test: device-map.c $(CUDA_PLUGIN_DIR)/cuda_device_map.c $(CUDA_P
 		-o $@ -Wl,--wrap,fork -Wl,--wrap,write -Wl,--wrap,close -ldl -lprotobuf-c
 
 cuda-backend-guard-test: backend-guard.c $(CUDA_PLUGIN_DIR)/cuda_plugin_driver.c \
-		$(CUDA_PLUGIN_DIR)/cuda_plugin_cli.c \
+		$(CUDA_PLUGIN_DIR)/cuda_plugin_cli.c $(CUDA_PLUGIN_DIR)/cuda_custom_storage.c \
 		$(CUDA_PLUGIN_DIR)/cuda_wait.c $(CUDA_PLUGIN_DIR)/cuda_wait.h ../../compel/libcompel.a
 	$(E) " LINK     " $@
 	$(Q)$(CC) $(CFLAGS) $(CUDA_TEST_CPPFLAGS) -I../../compel/include/uapi \
 		backend-guard.c $(CUDA_PLUGIN_DIR)/cuda_plugin_driver.c $(CUDA_PLUGIN_DIR)/cuda_plugin_cli.c \
-		$(CUDA_PLUGIN_DIR)/cuda_wait.c \
+		$(CUDA_PLUGIN_DIR)/cuda_custom_storage.c $(CUDA_PLUGIN_DIR)/cuda_wait.c \
 		../../compel/libcompel.a \
 		-Wl,--wrap,ptrace -Wl,--wrap,syscall -ldl -pthread -o $@
 

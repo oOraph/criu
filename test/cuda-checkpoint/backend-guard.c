@@ -127,6 +127,11 @@ int cuda_plugin_add_inventory(void)
 	return 0;
 }
 
+int criu_get_image_dir(void)
+{
+	return -1;
+}
+
 bool alarm_timeouted(void)
 {
 	return criu_timed_out;

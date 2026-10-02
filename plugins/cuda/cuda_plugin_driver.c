@@ -1,5 +1,7 @@
 #include "criu-log.h"
 #include "cuda_checkpoint.h"
+#include "cuda_custom_storage.h"
+#include "criu-plugin.h"
 #include "cuda_device_map.h"
 #include "cuda_plugin.h"
 #include "plugin.h"
@@ -251,6 +253,14 @@ static int cuda_driver_probe(bool device_map_requested)
 		pr_warn("CUDA checkpoint Driver API not available in libcuda.so.1\n");
 		cuda_api_fini();
 		return -ENOTSUP;
+	}
+
+	/* CUDA 13.4 custom-storage mode (driver >= R615): optional unless requested */
+	if (cuda_cs_init(cuda_handle)) {
+		if (cuda_cs_mode == CUDA_CS_ON) {
+			pr_err("cuda_plugin.custom-storage=on but libcuda has no custom-storage checkpoint API\n");
+			return -1;
+		}
 	}
 
 	driver_version = 0;
@@ -610,6 +620,7 @@ static int checkpoint_device(void *arg)
 	struct pid_info *task_info = arg;
 	int pid = task_info->pid;
 	CUcheckpointCheckpointArgs args = { 0 };
+	CUcheckpointCustomStorageInfo *cs_info = NULL;
 	cuda_task_state_t observed_task_state;
 	CUresult res;
 	int ret = 0;
@@ -619,12 +630,29 @@ static int checkpoint_device(void *arg)
 	 * can report the actual state while its restore thread is running.
 	 */
 	task_info->current_task_state = CUDA_TASK_CHECKPOINTED;
+	if (cuda_cs_active()) {
+		/* the custom-storage mode needs the driver initialised and the primary contexts retained in CRIU */
+		if (cuda_driver_init() || cuda_cs_prepare())
+			return -1;
+		args.customStorageInfo_out = &cs_info;
+	}
 	res = cuda_api.checkpoint(pid, &args);
 	if (atomic_load(&operation_aborted))
 		return -1;
 	if (res != CUDA_SUCCESS) {
 		cuda_log_error("cuCheckpointProcessCheckpoint", pid, res);
 		ret = -1;
+	} else if (cuda_cs_active()) {
+		/* the target is CHECKPOINTING: its VRAM is mapped into CRIU until we complete the operation */
+		if (!cs_info) {
+			pr_err("Driver returned no custom storage info for pid %d\n", pid);
+			ret = -1;
+		} else {
+			if (cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), false))
+				ret = -1;
+			if (cuda_cs_complete(cs_info->handle))
+				ret = -1;
+		}
 	}
 
 	observed_task_state = get_cuda_state(pid);
@@ -865,13 +893,16 @@ static int restore_device(void *arg)
 	if (current_task_state == CUDA_TASK_CHECKPOINTED) {
 		/* If the process was "locked" or "running" before checkpointing it, we need to restore it */
 		CUcheckpointRestoreArgs args = { 0 };
+		CUcheckpointCustomStorageInfo *cs_info = NULL;
 
 		if (op->map) {
 			args.gpuPairs = op->map->pairs;
 			args.gpuPairsCount = op->map->count;
 		}
+		if (cuda_cs_active())
+			args.customStorageInfo_out = &cs_info;
 
-		if (cuda_driver_init()) {
+		if (cuda_driver_init() || (cuda_cs_active() && cuda_cs_prepare())) {
 			if (atomic_load(&operation_aborted))
 				return -1;
 			ret = -1;
@@ -885,8 +916,21 @@ static int restore_device(void *arg)
 				 * LOCKED or RUNNING successfully.
 				 */
 				ret = -1;
-			} else
+			} else {
+				if (cuda_cs_active()) {
+					/* the target is RESTORING: fill its VRAM from gpu-cs-<nspid>.img, then complete */
+					if (!cs_info) {
+						pr_err("Driver returned no custom storage info for pid %d\n", pid);
+						ret = -1;
+					} else {
+						if (cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), true))
+							ret = -1;
+						if (cuda_cs_complete(cs_info->handle))
+							ret = -1;
+					}
+				}
 				current_task_state = CUDA_TASK_LOCKED;
+			}
 
 			observed_task_state = get_cuda_state(pid);
 			if (observed_task_state != CUDA_TASK_UNKNOWN)
