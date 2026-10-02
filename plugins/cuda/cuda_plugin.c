@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 
 #include "cuda_gpu_pages.h"
+#include "cuda_custom_storage.h"
 
 #ifdef LOG_PREFIX
 #undef LOG_PREFIX
@@ -28,6 +29,7 @@
 #define CUDA_PLUGIN_BACKEND_OPTION    CUDA_PLUGIN_NAME ".backend"
 #define CUDA_PLUGIN_DEVICE_MAP_OPTION CUDA_PLUGIN_NAME ".device-map"
 #define CUDA_PLUGIN_TIMEOUT_OPTION    CUDA_PLUGIN_NAME ".timeout"
+#define CUDA_PLUGIN_CS_OPTION	      CUDA_PLUGIN_NAME ".custom-storage"
 
 unsigned int cuda_plugin_timeout;
 
@@ -48,6 +50,7 @@ enum {
 	CUDA_PLUGIN_OPTION_BACKEND = 1000,
 	CUDA_PLUGIN_OPTION_DEVICE_MAP,
 	CUDA_PLUGIN_OPTION_TIMEOUT,
+	CUDA_PLUGIN_OPTION_CS,
 };
 
 static bool cuda_plugin_option_matches(const char *arg, const char *name,
@@ -94,11 +97,13 @@ static int parse_cuda_plugin_options(int stage)
 		{ CUDA_PLUGIN_BACKEND_OPTION, optional_argument, NULL, CUDA_PLUGIN_OPTION_BACKEND },
 		{ CUDA_PLUGIN_DEVICE_MAP_OPTION, optional_argument, NULL, CUDA_PLUGIN_OPTION_DEVICE_MAP },
 		{ CUDA_PLUGIN_TIMEOUT_OPTION, optional_argument, NULL, CUDA_PLUGIN_OPTION_TIMEOUT },
+		{ CUDA_PLUGIN_CS_OPTION, optional_argument, NULL, CUDA_PLUGIN_OPTION_CS },
 		{},
 	};
 	const char *backend_value = NULL;
 	const char *device_map_value = NULL;
 	const char *timeout_value = NULL;
+	const char *cs_value = NULL;
 	char *saved_optarg;
 	char **argv = NULL;
 	int saved_optopt;
@@ -140,6 +145,10 @@ static int parse_cuda_plugin_options(int stage)
 			if (cuda_plugin_option_matches(argv[optind - 1], CUDA_PLUGIN_TIMEOUT_OPTION, optarg, &ret))
 				timeout_value = optarg;
 			break;
+		case CUDA_PLUGIN_OPTION_CS:
+			if (cuda_plugin_option_matches(argv[optind - 1], CUDA_PLUGIN_CS_OPTION, optarg, &ret))
+				cs_value = optarg;
+			break;
 		case '?':
 			/* Every plugin receives the same namespaced option list. */
 			break;
@@ -156,6 +165,21 @@ static int parse_cuda_plugin_options(int stage)
 
 	if (ret)
 		return ret;
+
+	/* cuda_plugin.custom-storage=auto|on|off: CUDA 13.4 custom-storage mode (driver >= R615, Driver API backend) */
+	cuda_cs_mode = CUDA_CS_AUTO;
+	if (cs_value) {
+		if (!strcmp(cs_value, "auto"))
+			cuda_cs_mode = CUDA_CS_AUTO;
+		else if (!strcmp(cs_value, "on"))
+			cuda_cs_mode = CUDA_CS_ON;
+		else if (!strcmp(cs_value, "off"))
+			cuda_cs_mode = CUDA_CS_OFF;
+		else {
+			pr_err("Invalid cuda_plugin.custom-storage value '%s' (expected auto, on or off)\n", cs_value);
+			return -1;
+		}
+	}
 
 	if (backend_value) {
 		ret = parse_cuda_backend_option(backend_value);
@@ -371,7 +395,11 @@ static int cuda_plugin_checkpoint_devices(int pid)
 	/* Pre-scan: record anonymous private VMAs before the backend moves VRAM
 	 * into new staging mappings. Must run before any backend work on pid.
 	 */
-	if (scan_anon_private_vmas(pid, &vmas_before, &n_before) != 0) {
+	if (cuda_cs_active()) {
+		/* custom storage: no VRAM staging pages are created in the target, nothing to offload */
+		vmas_before = NULL;
+		n_before = 0;
+	} else if (scan_anon_private_vmas(pid, &vmas_before, &n_before) != 0) {
 		pr_warn("Pre-scan failed for pid %d, fast GPU page dump disabled\n", pid);
 		vmas_before = NULL;
 	}
@@ -462,7 +490,7 @@ static int cuda_plugin_resume_devices_late(int pid)
 		return 0;
 	}
 
-	ret = restore_gpu_staging_pages(pid);
+	ret = cuda_cs_active() ? 0 : restore_gpu_staging_pages(pid);
 	if (ret)
 		return ret;
 
