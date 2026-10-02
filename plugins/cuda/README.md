@@ -129,6 +129,33 @@ general-purpose CUDA header. Reserved fields are zeroed and must not be
 repurposed without an explicit driver-version check and verification of the
 corresponding CUDA release.
 
+## Custom-storage GPU memory (CUDA 13.4, driver >= R615)
+
+Both backends normally let the driver stage GPU memory in the target process's
+host memory, where CRIU dumps it with the regular page images and restores it
+before the driver copies it back. With a libcuda that exposes
+`cuCheckpointOperationComplete()` the Driver API backend can instead use the
+custom-storage mode: `cuCheckpointProcessCheckpoint()` maps the target's GPU
+memory into CRIU, the plugin writes it to `gpu-cs-<pid>.img` in the image
+directory with parallel pinned-buffer transfers, and the operation is completed.
+`cuCheckpointProcessRestore()` mirrors this before the unlock. The target never
+holds a host copy of its VRAM, the GPU memory does not transit through the
+page images, and the disk I/O overlaps the PCIe transfers.
+
+```
+--plugin-option=cuda_plugin.custom-storage=auto   # default: use it when the driver has the API
+--plugin-option=cuda_plugin.custom-storage=on     # fail if the API is unavailable
+--plugin-option=cuda_plugin.custom-storage=off
+```
+
+Requirements: the Driver API backend, driver R615 or newer (API 13040), and
+ptrace permission on the target (CAP_SYS_PTRACE under Yama ptrace_scope 1),
+because the driver maps another process's memory into CRIU. The number of
+transfer threads can be set with the `CUDA_CS_THREADS` environment variable
+(default 4; host-to-device copies into the mapping degrade with many
+concurrent streams). On NVSwitch systems the driver additionally needs a
+matching Fabric Manager, which NVIDIA has not published for R615 yet.
+
 ## GPU device mapping
 
 During a CUDA dump, the plugin saves the ordinal and UUID of each GPU in the
