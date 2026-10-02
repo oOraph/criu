@@ -562,20 +562,82 @@ int release_gpu_pages(int tid, uint64_t syscall_addr, struct gpu_region *regions
  *
  * open_tree(OPEN_TREE_CLONE) captures a detached anonymous mount of 'src'
  * while still in the host namespace — the source path does not need to be
- * accessible from inside the container.  After setns into the container's
- * mount namespace, move_mount attaches the detached mount at 'dst'.
+ * accessible from inside the container.  The setns + move_mount is done in
+ * a forked helper: setns(CLONE_NEWNS) fails with EINVAL in a multithreaded
+ * process, and CRIU is multithreaded once the cuda plugin's Driver API
+ * backend has started its worker thread (seen with multi-process vLLM: the
+ * second CUDA task's restore hook runs after the first backend call).  The
+ * helper also keeps CRIU's own cwd/namespace untouched.
  */
+static int run_in_mntns(int pid, int (*fn)(void *), void *arg)
+{
+	char ns_path[64];
+	int ns_fd, status;
+	pid_t child;
+
+	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
+	ns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+	if (ns_fd < 0) {
+		pr_perror("Cannot open container mount namespace %s", ns_path);
+		return -1;
+	}
+
+	child = fork();
+	if (child < 0) {
+		pr_perror("fork for mount namespace helper failed");
+		close(ns_fd);
+		return -1;
+	}
+	if (child == 0) {
+		if (syscall(SYS_setns, ns_fd, CLONE_NEWNS) < 0) {
+			pr_perror("setns to container mount namespace failed");
+			_exit(1);
+		}
+		_exit(fn(arg) == 0 ? 0 : 1);
+	}
+	close(ns_fd);
+	if (waitpid(child, &status, 0) < 0) {
+		pr_perror("waitpid for mount namespace helper failed");
+		return -1;
+	}
+	return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+struct mnt_args {
+	int tree_fd;
+	const char *src;
+	const char *dst;
+};
+
+static int do_move_mount(void *p)
+{
+	struct mnt_args *a = p;
+
+	if (syscall(SYS_move_mount, a->tree_fd, "", AT_FDCWD, a->dst,
+		    MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+		pr_perror("move_mount %s -> %s failed", a->src, a->dst);
+		return -1;
+	}
+	return 0;
+}
+
+static int do_umount(void *p)
+{
+	struct mnt_args *a = p;
+
+	return (int)syscall(SYS_umount2, a->dst, MNT_DETACH);
+}
+
 static int bind_mount_in_container(int pid, const char *src, const char *dst)
 {
 	char proc_dst[PATH_MAX];
-	char ns_path[64];
-	int tree_fd = -1, saved_mns_fd = -1, container_mns_fd = -1, cwd_fd = -1;
-	int fd, ret = -1;
+	struct mnt_args a = { .src = src, .dst = dst };
+	int fd, ret;
 
 	/* Capture a detached clone of src's mount in the host namespace. */
-	tree_fd = (int)syscall(SYS_open_tree, AT_FDCWD, src,
-			       OPEN_TREE_CLONE | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW);
-	if (tree_fd < 0) {
+	a.tree_fd = (int)syscall(SYS_open_tree, AT_FDCWD, src,
+				 OPEN_TREE_CLONE | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW);
+	if (a.tree_fd < 0) {
 		pr_perror("open_tree %s failed", src);
 		return -1;
 	}
@@ -585,98 +647,21 @@ static int bind_mount_in_container(int pid, const char *src, const char *dst)
 	fd = open(proc_dst, O_CREAT | O_WRONLY | O_TRUNC, 0600);
 	if (fd < 0) {
 		pr_perror("Cannot create bind mount destination %s", proc_dst);
-		goto out;
+		close(a.tree_fd);
+		return -1;
 	}
 	close(fd);
 
-	saved_mns_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
-	if (saved_mns_fd < 0) {
-		pr_perror("Cannot open /proc/self/ns/mnt");
-		goto out;
-	}
-
-	/*
-	 * Save CWD before entering the container namespace.  The container's
-	 * mnt ns may not contain the host work directory, leaving the CWD
-	 * detached after setns; fchdir restores it on the way back so that
-	 * CRIU's relative paths (e.g. .criu.cgyard.*) remain resolvable.
-	 */
-	cwd_fd = open(".", O_PATH | O_DIRECTORY);
-	if (cwd_fd < 0) {
-		pr_perror("Cannot open current directory");
-		goto out;
-	}
-
-	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
-	container_mns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
-	if (container_mns_fd < 0) {
-		pr_perror("Cannot open container mount namespace %s", ns_path);
-		goto out;
-	}
-
-	if (syscall(SYS_setns, container_mns_fd, CLONE_NEWNS) < 0) {
-		pr_perror("setns to container mount namespace failed");
-		goto out;
-	}
-
-	if (syscall(SYS_move_mount, tree_fd, "", AT_FDCWD, dst,
-		    MOVE_MOUNT_F_EMPTY_PATH) < 0)
-		pr_perror("move_mount %s -> %s failed", src, dst);
-	else
-		ret = 0;
-
-	if (syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS) < 0) {
-		pr_perror("setns back to host mount namespace failed");
-		ret = -1;
-	} else if (fchdir(cwd_fd) < 0) {
-		pr_perror("fchdir to restore working directory failed");
-		ret = -1;
-	}
-out:
-	if (tree_fd >= 0)
-		close(tree_fd);
-	if (saved_mns_fd >= 0)
-		close(saved_mns_fd);
-	if (container_mns_fd >= 0)
-		close(container_mns_fd);
-	if (cwd_fd >= 0)
-		close(cwd_fd);
+	ret = run_in_mntns(pid, do_move_mount, &a);
+	close(a.tree_fd);
 	return ret;
 }
 
 static void umount_in_container(int pid, const char *dst)
 {
-	char ns_path[64];
-	int saved_mns_fd, container_mns_fd, cwd_fd;
+	struct mnt_args a = { .tree_fd = -1, .dst = dst };
 
-	saved_mns_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
-	if (saved_mns_fd < 0)
-		return;
-
-	cwd_fd = open(".", O_PATH | O_DIRECTORY);
-	if (cwd_fd < 0) {
-		close(saved_mns_fd);
-		return;
-	}
-
-	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
-	container_mns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
-	if (container_mns_fd < 0) {
-		close(saved_mns_fd);
-		close(cwd_fd);
-		return;
-	}
-
-	if (syscall(SYS_setns, container_mns_fd, CLONE_NEWNS) == 0) {
-		syscall(SYS_umount2, dst, MNT_DETACH);
-		if (syscall(SYS_setns, saved_mns_fd, CLONE_NEWNS) < 0)
-			pr_perror("setns back to host mount namespace failed in umount");
-		else if (fchdir(cwd_fd) < 0)
-			pr_perror("fchdir to restore working directory failed in umount");
-	}
-	close(container_mns_fd);
-	close(saved_mns_fd);
-	close(cwd_fd);
+	run_in_mntns(pid, do_umount, &a);
 }
 
 /*
