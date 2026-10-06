@@ -1,0 +1,132 @@
+#!/bin/sh
+# Custom-storage mode (cuda_plugin.custom-storage=auto|on|off) against the mock Driver API: the mock's
+# device memory is filled from a file on checkpoint and written to another file after restore; both
+# must match. "off" keeps the regular path and "on" fails without the API.
+
+set -eu
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+CRIU="$ROOT/criu/criu"
+MOCK_DIR="$ROOT/test/cuda-checkpoint"
+WORK_DIR=$(mktemp -d)
+TARGET_PID=
+
+cleanup()
+{
+	status=$?
+	if [ -n "$TARGET_PID" ]; then
+		kill "$TARGET_PID" 2>/dev/null || true
+		wait "$TARGET_PID" 2>/dev/null || true
+	fi
+	# Keep CRIU logs from a failed run for inspection.
+	if [ "$status" -eq 0 ]; then
+		rm -rf "$WORK_DIR"
+	else
+		echo "Keeping $WORK_DIR" >&2
+	fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+fail()
+{
+	echo "$*"
+	exit 1
+}
+
+# Kill a restored target and wait until its PID is free again for the next restore.
+stop_target()
+{
+	kill "$TARGET_PID"
+	for _ in $(seq 100); do
+		[ -d "/proc/$TARGET_PID" ] || return 0
+		sleep 0.1
+	done
+	fail "restored process $TARGET_PID did not go away"
+}
+
+# criu <action> <images> <mock library dir> [criu options...]
+criu()
+{
+	ACTION=$1
+	IMAGES=$2
+	LIB_DIR=$3
+	shift 3
+	timeout 60s env \
+		CRIU_FAULT=138 \
+		CRIU_CUDA_MOCK_INITIAL_STATE="$([ "$ACTION" = restore ] && echo checkpointed || echo running)" \
+		CRIU_CUDA_MOCK_CS_INPUT="$WORK_DIR/gpu-in" \
+		CRIU_CUDA_MOCK_CS_OUTPUT="$WORK_DIR/gpu-out" \
+		CUDA_CS_THREADS="${CS_THREADS:-4}" \
+		LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+		"$CRIU" "$ACTION" --no-default-config --images-dir "$IMAGES" --log-file "$ACTION.log" \
+		--verbosity=4 --libdir "$ROOT/plugins/cuda" --shell-job "$@"
+}
+
+# dump <images> <mock library dir> <custom-storage mode>
+dump()
+{
+	mkdir "$1"
+	sleep 300 &
+	TARGET_PID=$!
+	STATUS=0
+	criu dump "$1" "$2" --tree "$TARGET_PID" --timeout 10 --plugin-option "cuda_plugin.custom-storage=$3" ||
+		STATUS=$?
+	kill "$TARGET_PID" 2>/dev/null || true
+	wait "$TARGET_PID" 2>/dev/null || true
+	return "$STATUS"
+}
+
+make -C "$ROOT" cuda_plugin
+make -C "$MOCK_DIR"
+
+# Two devices (the mock's default), each with two full 64 MiB transfer chunks and a partial, unaligned
+# one: three workers move them in parallel.
+head -c $((4 * 64 * 1024 * 1024 + 4093)) /dev/urandom >"$WORK_DIR/gpu-in"
+
+# auto: the API is there, so the GPU memory goes through gpu-cs-<pid>.img and comes back intact.
+dump "$WORK_DIR/auto" "$MOCK_DIR/custom-storage" auto || fail "auto: dump failed"
+CS_IMAGE="$WORK_DIR/auto/gpu-cs-$TARGET_PID.img"
+[ -s "$CS_IMAGE" ] || fail "auto: no $CS_IMAGE"
+[ "$(grep -c "custom-storage checkpoint copy: .*, 3 threads," "$WORK_DIR/auto/dump.log")" -eq 2 ] ||
+	fail "auto: dump did not use 3 workers on each of the 2 devices"
+criu restore "$WORK_DIR/auto" "$MOCK_DIR/custom-storage" --restore-detached || fail "auto: restore failed"
+cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "auto: restored GPU memory differs"
+[ "$(grep -c "custom-storage restore copy: .*, 3 threads," "$WORK_DIR/auto/restore.log")" -eq 2 ] ||
+	fail "auto: restore did not use 3 workers on each of the 2 devices"
+stop_target
+
+# One worker per device moves all three chunks, cycling through its two pinned buffers.
+rm "$WORK_DIR/gpu-out"
+CS_THREADS=1
+criu restore "$WORK_DIR/auto" "$MOCK_DIR/custom-storage" --restore-detached || fail "1 worker: restore failed"
+CS_THREADS=
+cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "1 worker: restored GPU memory differs"
+grep -q "custom-storage restore copy: .*, 1 threads," "$WORK_DIR/auto/restore.log" || fail "1 worker: not 1 thread"
+stop_target
+
+# The restored bytes come from the image: corrupt one and the output differs.
+printf 'X' | dd of="$CS_IMAGE" bs=1 seek=8192 conv=notrunc status=none
+criu restore "$WORK_DIR/auto" "$MOCK_DIR/custom-storage" --restore-detached || fail "corrupted: restore failed"
+stop_target
+TARGET_PID=
+if cmp -s "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out"; then
+	fail "corrupted: restored GPU memory did not come from the image"
+fi
+
+# off: the API is there but must not be used.
+dump "$WORK_DIR/off" "$MOCK_DIR/custom-storage" off || fail "off: dump failed"
+TARGET_PID=
+if ls "$WORK_DIR"/off/gpu-cs-*.img >/dev/null 2>&1; then
+	fail "off: a custom-storage image was written"
+fi
+
+# on: a driver without the API must fail the dump.
+if dump "$WORK_DIR/on" "$MOCK_DIR" on; then
+	fail "on: dump succeeded without the custom-storage API"
+fi
+TARGET_PID=
+grep -q "custom-storage=on but libcuda has no custom-storage checkpoint API" "$WORK_DIR/on/dump.log" ||
+	fail "on: missing error"
+
+echo "CUDA custom storage PASS"

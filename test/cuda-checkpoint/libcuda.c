@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,12 @@
  * it reports every PID as CUDA and keeps a synthetic process state so
  * tests can verify the plugin's API calls, ptrace coordination, state
  * transitions, and rollback handling without NVIDIA hardware.
+ *
+ * Built with MOCK_CUDA_CUSTOM_STORAGE, it also provides the CUDA 13.4
+ * custom-storage mode. The memory of the CRIU_CUDA_MOCK_CS_DEVICES devices
+ * (default 2) is one host buffer split in equal parts: filled from
+ * CRIU_CUDA_MOCK_CS_INPUT on checkpoint, written to CRIU_CUDA_MOCK_CS_OUTPUT
+ * when a restore completes, so the test can compare the two files.
  */
 
 #define MOCK_CUDA_SUCCESS	      0
@@ -393,6 +400,151 @@ static bool checkpoint_behavior(int pid, const char *behavior)
 	return false;
 }
 
+#ifdef MOCK_CUDA_CUSTOM_STORAGE
+/* Layouts from plugins/cuda/cuda_custom_storage.h */
+struct mock_cs_device {
+	unsigned long long dev_ptr;
+	size_t size;
+	void *stream;
+};
+
+struct mock_cs_info {
+	void *handle;
+	struct mock_cs_device *devices;
+	unsigned int device_count;
+};
+
+static struct mock_cs_device cs_devices[MOCK_GPU_COUNT];
+static struct mock_cs_info cs_info = { &cs_info, cs_devices, 0 };
+static char *cs_buf;
+static size_t cs_size;
+static bool cs_restoring;
+static __thread void *current_ctx; /* copies need a context set in the calling thread */
+
+/* customStorageInfo_out is at offset 0 of the checkpoint args, 16 of the restore args. */
+static int mock_cs_begin(bool restore, void *args, size_t out_offset)
+{
+	struct mock_cs_info **out = *(struct mock_cs_info ***)((char *)args + out_offset);
+	int i, n = atoi(getenv("CRIU_CUDA_MOCK_CS_DEVICES") ?: "2");
+	char *buf = NULL;
+	FILE *file;
+	long size;
+
+	if (n < 1 || n > MOCK_GPU_COUNT)
+		return -1;
+	if (!out)
+		return 0; /* custom storage not requested */
+	file = fopen(getenv("CRIU_CUDA_MOCK_CS_INPUT") ?: "", "r");
+	if (!file || fseek(file, 0, SEEK_END) || (size = ftell(file)) <= 0 || !(buf = malloc(size)))
+		return -1;
+	rewind(file);
+	if (restore)
+		memset(buf, 0xa5, size);
+	else if (fread(buf, 1, size, file) != (size_t)size)
+		return -1;
+	fclose(file);
+	for (i = 0; i < n; i++) {
+		size_t start = size * i / n, end = size * (i + 1) / n;
+
+		cs_devices[i] = (struct mock_cs_device){ (uintptr_t)(buf + start), end - start, &cs_devices[i] };
+	}
+	cs_info.device_count = n;
+	cs_buf = buf;
+	cs_size = size;
+	cs_restoring = restore;
+	*out = &cs_info;
+	return 0;
+}
+
+mock_cuda_result_t cuCheckpointOperationComplete(void *handle)
+{
+	FILE *file;
+
+	if (handle != &cs_info)
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
+	if (cs_restoring) {
+		file = fopen(getenv("CRIU_CUDA_MOCK_CS_OUTPUT") ?: "", "w");
+		if (!file || fwrite(cs_buf, 1, cs_size, file) != cs_size || fclose(file))
+			return MOCK_CUDA_ERROR_INVALID_VALUE;
+	}
+	free(cs_buf);
+	return MOCK_CUDA_SUCCESS;
+}
+
+#define MOCK_NOOP(name, ...)                 \
+	mock_cuda_result_t name(__VA_ARGS__) \
+	{                                    \
+		return MOCK_CUDA_SUCCESS;    \
+	}
+MOCK_NOOP(cuStreamDestroy, void *stream)
+MOCK_NOOP(cuStreamSynchronize, void *stream)
+MOCK_NOOP(cuEventRecord, void *event, void *stream)
+MOCK_NOOP(cuEventSynchronize, void *event)
+
+mock_cuda_result_t cuDevicePrimaryCtxRetain(void **ctx, int device)
+{
+	*ctx = &cs_info;
+	return MOCK_CUDA_SUCCESS;
+}
+
+mock_cuda_result_t cuCtxSetCurrent(void *ctx)
+{
+	current_ctx = ctx;
+	return MOCK_CUDA_SUCCESS;
+}
+
+mock_cuda_result_t cuStreamCreate(void **stream, unsigned int flags)
+{
+	*stream = &cs_info;
+	return current_ctx ? MOCK_CUDA_SUCCESS : MOCK_CUDA_ERROR_INVALID_VALUE;
+}
+
+mock_cuda_result_t cuEventCreate(void **event, unsigned int flags)
+{
+	*event = &cs_info;
+	return MOCK_CUDA_SUCCESS;
+}
+
+mock_cuda_result_t cuMemHostAlloc(void **ptr, size_t size, unsigned int flags)
+{
+	return posix_memalign(ptr, 4096, size) ? MOCK_CUDA_ERROR_INVALID_VALUE : MOCK_CUDA_SUCCESS;
+}
+
+mock_cuda_result_t cuMemFreeHost(void *ptr)
+{
+	free(ptr);
+	return MOCK_CUDA_SUCCESS;
+}
+
+mock_cuda_result_t cuMemcpyDtoHAsync(void *dst, unsigned long long src, size_t size, void *stream)
+{
+	memcpy(dst, (void *)(uintptr_t)src, size);
+	return current_ctx ? MOCK_CUDA_SUCCESS : MOCK_CUDA_ERROR_INVALID_VALUE;
+}
+
+mock_cuda_result_t cuMemcpyHtoDAsync(unsigned long long dst, const void *src, size_t size, void *stream)
+{
+	memcpy((void *)(uintptr_t)dst, src, size);
+	return current_ctx ? MOCK_CUDA_SUCCESS : MOCK_CUDA_ERROR_INVALID_VALUE;
+}
+
+/* Only the 3-argument cuStreamGetCtx_v2 exists; the plugin must get it through cuGetProcAddress. */
+static mock_cuda_result_t stream_get_ctx_v2(void *stream, void **ctx, void **green_ctx)
+{
+	*ctx = &cs_info;
+	*green_ctx = NULL;
+	return MOCK_CUDA_SUCCESS;
+}
+
+/* Everything else is looked up with dlsym by the plugin. */
+mock_cuda_result_t cuGetProcAddress_v2(const char *symbol, void **pfn, int version, unsigned long long flags,
+				       int *status)
+{
+	*pfn = strcmp(symbol, "cuStreamGetCtx") ? NULL : (void *)stream_get_ctx_v2;
+	return *pfn ? MOCK_CUDA_SUCCESS : MOCK_CUDA_ERROR_INVALID_VALUE;
+}
+#endif /* MOCK_CUDA_CUSTOM_STORAGE */
+
 mock_cuda_result_t cuCheckpointProcessCheckpoint(int pid, void *args)
 {
 	struct mock_process *process = get_process(pid);
@@ -405,6 +557,10 @@ mock_cuda_result_t cuCheckpointProcessCheckpoint(int pid, void *args)
 	if (!process || process->state != MOCK_CUDA_PROCESS_STATE_LOCKED)
 		return MOCK_CUDA_ERROR_INVALID_VALUE;
 	process->state = MOCK_CUDA_PROCESS_STATE_CHECKPOINTED;
+#ifdef MOCK_CUDA_CUSTOM_STORAGE
+	if (mock_cs_begin(false, args, 0))
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
+#endif
 	/* Test rollback when the mock changes state before reporting an error. */
 	if (getenv("CRIU_CUDA_MOCK_CHECKPOINT_ERROR_AFTER_TRANSITION"))
 		return MOCK_CUDA_ERROR_INVALID_VALUE;
@@ -426,6 +582,10 @@ mock_cuda_result_t cuCheckpointProcessRestore(int pid, void *args)
 		return MOCK_CUDA_ERROR_INVALID_VALUE;
 	if (record_device_map(args))
 		return MOCK_CUDA_ERROR_INVALID_VALUE;
+#ifdef MOCK_CUDA_CUSTOM_STORAGE
+	if (mock_cs_begin(true, args, 16))
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
+#endif
 	process->state = MOCK_CUDA_PROCESS_STATE_LOCKED;
 	return MOCK_CUDA_SUCCESS;
 }
