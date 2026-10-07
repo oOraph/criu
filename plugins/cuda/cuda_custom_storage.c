@@ -296,6 +296,16 @@ struct cs_warg {
 	int id;
 };
 
+/* A failed copy may only be reported by a later synchronisation: check every call. */
+#define CS_CALL(call, name)                                                 \
+	do {                                                                \
+		CUresult __r = (call);                                      \
+		if (__r != CUDA_SUCCESS) {                                  \
+			pr_err("[w%d] %s: %s\n", w->id, name, cs_err(__r)); \
+			goto fail;                                          \
+		}                                                           \
+	} while (0)
+
 static void *cs_worker(void *p)
 {
 	struct cs_warg *w = p;
@@ -304,26 +314,14 @@ static void *cs_worker(void *p)
 	CUevent ev[2] = { NULL, NULL };
 	CUstream st = NULL;
 	int inflight[2] = { 0, 0 };
-	CUresult r;
+	ssize_t done;
 	int b = 0, i;
 
-	if ((r = cs.ctx_set_current(x->ctx)) != CUDA_SUCCESS) {
-		pr_err("[w%d] cuCtxSetCurrent: %s\n", w->id, cs_err(r));
-		goto fail;
-	}
-	if ((r = cs.stream_create(&st, 1 /* CU_STREAM_NON_BLOCKING */)) != CUDA_SUCCESS) {
-		pr_err("[w%d] cuStreamCreate: %s\n", w->id, cs_err(r));
-		goto fail;
-	}
+	CS_CALL(cs.ctx_set_current(x->ctx), "cuCtxSetCurrent");
+	CS_CALL(cs.stream_create(&st, 1 /* CU_STREAM_NON_BLOCKING */), "cuStreamCreate");
 	for (i = 0; i < 2; i++) {
-		if ((r = cs.mem_host_alloc(&buf[i], CS_CHUNK, 1 /* CU_MEMHOSTALLOC_PORTABLE */)) != CUDA_SUCCESS) {
-			pr_err("[w%d] cuMemHostAlloc: %s\n", w->id, cs_err(r));
-			goto fail;
-		}
-		if ((r = cs.event_create(&ev[i], 2 /* CU_EVENT_DISABLE_TIMING */)) != CUDA_SUCCESS) {
-			pr_err("[w%d] cuEventCreate: %s\n", w->id, cs_err(r));
-			goto fail;
-		}
+		CS_CALL(cs.mem_host_alloc(&buf[i], CS_CHUNK, 1 /* CU_MEMHOSTALLOC_PORTABLE */), "cuMemHostAlloc");
+		CS_CALL(cs.event_create(&ev[i], 2 /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
 	}
 
 	for (;; b ^= 1) {
@@ -335,38 +333,39 @@ static void *cs_worker(void *p)
 		len = x->size - off < CS_CHUNK ? x->size - off : CS_CHUNK;
 		iolen = x->direct ? ((len + 4095) & ~4095UL) : len;
 		if (inflight[b]) {
-			cs.event_synchronize(ev[b]);
+			CS_CALL(cs.event_synchronize(ev[b]), "cuEventSynchronize");
 			inflight[b] = 0;
 		}
 		if (!x->restore) {
-			if ((r = cs.memcpy_dtoh_async(buf[b], x->dptr + off, len, st)) != CUDA_SUCCESS) {
-				pr_err("[w%d] cuMemcpyDtoHAsync: %s\n", w->id, cs_err(r));
-				goto fail;
-			}
-			cs.event_record(ev[b], st);
-			cs.event_synchronize(ev[b]);
+			CS_CALL(cs.memcpy_dtoh_async(buf[b], x->dptr + off, len, st), "cuMemcpyDtoHAsync");
+			CS_CALL(cs.event_record(ev[b], st), "cuEventRecord");
+			CS_CALL(cs.event_synchronize(ev[b]), "cuEventSynchronize");
 			if (x->mem) {
 				memcpy(x->mem + x->file_off + off, buf[b], len);
-			} else if (pwrite(x->fd, buf[b], iolen, x->file_off + off) != (ssize_t)iolen) {
-				pr_perror("[w%d] pwrite", w->id);
+			} else if ((done = pwrite(x->fd, buf[b], iolen, x->file_off + off)) != (ssize_t)iolen) {
+				if (done < 0)
+					pr_perror("[w%d] pwrite", w->id);
+				else
+					pr_err("[w%d] short write: %zd of %zu bytes\n", w->id, done, iolen);
 				goto fail;
 			}
 		} else {
 			if (x->mem) {
 				memcpy(buf[b], x->mem + x->file_off + off, len);
-			} else if (pread(x->fd, buf[b], iolen, x->file_off + off) < (ssize_t)len) {
-				pr_perror("[w%d] pread", w->id);
+			} else if ((done = pread(x->fd, buf[b], iolen, x->file_off + off)) < (ssize_t)len) {
+				if (done < 0)
+					pr_perror("[w%d] pread", w->id);
+				else
+					pr_err("[w%d] short read: %zd of %zu bytes, the image is truncated\n", w->id, done,
+					       len);
 				goto fail;
 			}
-			if ((r = cs.memcpy_htod_async(x->dptr + off, buf[b], len, st)) != CUDA_SUCCESS) {
-				pr_err("[w%d] cuMemcpyHtoDAsync: %s\n", w->id, cs_err(r));
-				goto fail;
-			}
-			cs.event_record(ev[b], st);
+			CS_CALL(cs.memcpy_htod_async(x->dptr + off, buf[b], len, st), "cuMemcpyHtoDAsync");
+			CS_CALL(cs.event_record(ev[b], st), "cuEventRecord");
 			inflight[b] = 1;
 		}
 	}
-	cs.stream_synchronize(st);
+	CS_CALL(cs.stream_synchronize(st), "cuStreamSynchronize");
 	goto out;
 fail:
 	atomic_store(&x->err, 1);
@@ -380,6 +379,7 @@ out:
 			cs.mem_free_host(buf[i]);
 	return NULL;
 }
+#undef CS_CALL
 
 static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomStoragePerDeviceData *d, bool restore,
 			  bool direct)
@@ -425,7 +425,8 @@ static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomS
 	for (i = 0; i < n; i++) {
 		wa[i].x = &x;
 		wa[i].id = i;
-		if (pthread_create(&th[i], NULL, cs_worker, &wa[i])) {
+		errno = pthread_create(&th[i], NULL, cs_worker, &wa[i]);
+		if (errno) {
 			pr_perror("pthread_create");
 			atomic_store(&x.err, 1);
 			n = i;
@@ -434,7 +435,10 @@ static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomS
 	}
 	for (i = 0; i < n; i++)
 		pthread_join(th[i], NULL);
-	cs.stream_synchronize(d->stream);
+	if ((r = cs.stream_synchronize(d->stream)) != CUDA_SUCCESS) {
+		pr_err("cuStreamSynchronize on the mapping's stream: %s\n", cs_err(r));
+		atomic_store(&x.err, 1);
+	}
 	pr_info("[timing] custom-storage %s: %.2f GB, %d threads, %.0f ms (%.1f GB/s, %s)\n",
 		restore ? "restore copy" : "checkpoint copy", d->size / 1e9, n, cs_now_ms() - t0,
 		d->size / (cs_now_ms() - t0) / 1e6, mem ? "host memory" : direct ? "O_DIRECT" : "buffered");
@@ -515,8 +519,11 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 			goto out;
 		off += (d->size + 4095) & ~4095UL;
 	}
-	if (!restore && !direct)
-		fdatasync(fd);
+	/* O_DIRECT bypasses the page cache, not the device's write cache. */
+	if (!restore && fdatasync(fd)) {
+		pr_perror("Unable to sync %s", fname);
+		goto out;
+	}
 	ret = 0;
 out:
 	free(hb);

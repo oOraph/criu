@@ -22,6 +22,8 @@
  * (default 2) is one host buffer split in equal parts: filled from
  * CRIU_CUDA_MOCK_CS_INPUT on checkpoint, written to CRIU_CUDA_MOCK_CS_OUTPUT
  * when a restore completes, so the test can compare the two files.
+ * CRIU_CUDA_MOCK_CS_SYNC_ERROR makes the synchronisations fail, as they do
+ * when an asynchronous copy failed.
  */
 
 #define MOCK_CUDA_SUCCESS	      0
@@ -477,9 +479,18 @@ mock_cuda_result_t cuCheckpointOperationComplete(void *handle)
 		return MOCK_CUDA_SUCCESS;    \
 	}
 MOCK_NOOP(cuStreamDestroy, void *stream)
-MOCK_NOOP(cuStreamSynchronize, void *stream)
 MOCK_NOOP(cuEventRecord, void *event, void *stream)
-MOCK_NOOP(cuEventSynchronize, void *event)
+
+/* Errors of asynchronous copies show up when synchronising. */
+mock_cuda_result_t cuEventSynchronize(void *event)
+{
+	return getenv("CRIU_CUDA_MOCK_CS_SYNC_ERROR") ? MOCK_CUDA_ERROR_INVALID_VALUE : MOCK_CUDA_SUCCESS;
+}
+
+mock_cuda_result_t cuStreamSynchronize(void *stream)
+{
+	return getenv("CRIU_CUDA_MOCK_CS_SYNC_ERROR") ? MOCK_CUDA_ERROR_INVALID_VALUE : MOCK_CUDA_SUCCESS;
+}
 
 mock_cuda_result_t cuDevicePrimaryCtxRetain(void **ctx, int device)
 {

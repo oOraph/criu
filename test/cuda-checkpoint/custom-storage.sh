@@ -194,6 +194,25 @@ fi
 grep -q "GPU memory of pid .* was not restored" "$WORK_DIR/truncated/restore.log" ||
 	fail "truncated: missing error"
 
+# A failed asynchronous copy, reported when synchronising, fails the restore,
+if CRIU_CUDA_MOCK_CS_SYNC_ERROR=1 criu restore "$CS_IMAGES" "$MOCK_DIR/custom-storage" --restore-detached; then
+	fail "sync error: restore succeeded"
+fi
+grep -q "Synchronize.*: mock CUDA error" "$CS_IMAGES/restore.log" || fail "sync error: restore error not reported"
+# and the dump. No copy of the GPU memory can be kept either, so the task is killed, not resumed without it.
+mkdir "$WORK_DIR/sync"
+sleep 300 &
+TARGET_PID=$!
+if CRIU_CUDA_MOCK_CS_SYNC_ERROR=1 criu dump "$WORK_DIR/sync" "$MOCK_DIR/custom-storage" --tree "$TARGET_PID" \
+	--timeout 10; then
+	fail "sync error: dump succeeded"
+fi
+grep -q "Synchronize.*: mock CUDA error" "$WORK_DIR/sync/dump.log" || fail "sync error: dump error not reported"
+grep -q "GPU memory of pid $TARGET_PID was lost" "$WORK_DIR/sync/dump.log" || fail "sync error: loss not reported"
+wait "$TARGET_PID" 2>/dev/null || true
+kill -0 "$TARGET_PID" 2>/dev/null && fail "sync error: the task without its GPU memory was resumed"
+TARGET_PID=
+
 # on: a driver without the API must fail the dump.
 if dump "$WORK_DIR/on" "$MOCK_DIR" on; then
 	fail "on: dump succeeded without the custom-storage API"
