@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <dlfcn.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -519,6 +523,8 @@ mock_cuda_result_t cuCheckpointOperationComplete(void *handle)
 	}
 MOCK_NOOP(cuStreamDestroy, void *stream)
 MOCK_NOOP(cuEventRecord, void *event, void *stream)
+MOCK_NOOP(cuEventDestroy, void *event)
+MOCK_NOOP(cuDevicePrimaryCtxRelease, int device)
 
 /* Errors of asynchronous copies show up when synchronising. */
 mock_cuda_result_t cuEventSynchronize(void *event)
@@ -567,8 +573,14 @@ mock_cuda_result_t cuEventCreate(void **event, unsigned int flags)
 	return MOCK_CUDA_SUCCESS;
 }
 
+/* CRIU_CUDA_MOCK_CS_MAX_HOST_ALLOCS caps the pinned allocations of one CRIU run. */
 mock_cuda_result_t cuMemHostAlloc(void **ptr, size_t size, unsigned int flags)
 {
+	static int allocs;
+	const char *max = getenv("CRIU_CUDA_MOCK_CS_MAX_HOST_ALLOCS");
+
+	if (max && ++allocs > atoi(max))
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
 	return posix_memalign(ptr, 4096, size) ? MOCK_CUDA_ERROR_INVALID_VALUE : MOCK_CUDA_SUCCESS;
 }
 
@@ -602,11 +614,24 @@ static mock_cuda_result_t stream_get_ctx_v2(void *stream, void **ctx, void **gre
 	return MOCK_CUDA_SUCCESS;
 }
 
-/* Everything else is looked up with dlsym by the plugin. */
+/* The plugin resolves everything here; versioned symbols get their latest ABI, as from the driver. */
 mock_cuda_result_t cuGetProcAddress_v2(const char *symbol, void **pfn, int version, unsigned long long flags,
 				       int *status)
 {
-	*pfn = strcmp(symbol, "cuStreamGetCtx") ? NULL : (void *)stream_get_ctx_v2;
+	Dl_info self;
+	void *handle;
+
+	if (!strcmp(symbol, "cuStreamGetCtx")) {
+		*pfn = (void *)stream_get_ctx_v2;
+	} else if (!strcmp(symbol, "cuDeviceGetUuid")) {
+		*pfn = (void *)cuDeviceGetUuid_v2;
+	} else {
+		if (!dladdr((void *)cuGetProcAddress_v2, &self) ||
+		    !(handle = dlopen(self.dli_fname, RTLD_LAZY | RTLD_NOLOAD)))
+			return MOCK_CUDA_ERROR_INVALID_VALUE;
+		*pfn = dlsym(handle, symbol);
+		dlclose(handle);
+	}
 	return *pfn ? MOCK_CUDA_SUCCESS : MOCK_CUDA_ERROR_INVALID_VALUE;
 }
 #endif /* MOCK_CUDA_CUSTOM_STORAGE */

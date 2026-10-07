@@ -90,6 +90,8 @@ make -C "$MOCK_DIR"
 head -c $((4 * 64 * 1024 * 1024 + 4093)) /dev/urandom >"$WORK_DIR/gpu-in"
 
 # auto: the API is there, so the GPU memory goes through gpu-cs-<pid>.img and comes back intact.
+# Each worker's two pinned buffers serve every device: 3 workers, 6 allocations.
+export CRIU_CUDA_MOCK_CS_MAX_HOST_ALLOCS=6
 dump "$WORK_DIR/auto" "$MOCK_DIR/custom-storage" auto || fail "auto: dump failed"
 CS_IMAGE="$WORK_DIR/auto/gpu-cs-$TARGET_PID.img"
 [ -s "$CS_IMAGE" ] || fail "auto: no $CS_IMAGE"
@@ -99,6 +101,7 @@ criu restore "$WORK_DIR/auto" "$MOCK_DIR/custom-storage" --restore-detached || f
 cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "auto: restored GPU memory differs"
 [ "$(grep -c "custom-storage restore copy: .*, 3 threads," "$WORK_DIR/auto/restore.log")" -eq 2 ] ||
 	fail "auto: restore did not use 3 workers on each of the 2 devices"
+unset CRIU_CUDA_MOCK_CS_MAX_HOST_ALLOCS
 stop_target
 
 # One worker per device moves all three chunks, cycling through its two pinned buffers.

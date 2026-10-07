@@ -1191,6 +1191,8 @@ static void cuda_driver_backend_fini(int stage, int ret)
 		free_cuda_pid_list();
 	}
 
+	cuda_cs_fini();
+
 	cuda_api_fini();
 }
 

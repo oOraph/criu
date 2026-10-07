@@ -156,7 +156,9 @@ checkpointed process itself needs no privilege. The number of
 transfer threads can be set with the `CUDA_CS_THREADS` environment variable
 (default 4; host-to-device copies into the mapping degrade with many
 concurrent streams). On NVSwitch systems CUDA also needs NVIDIA Fabric
-Manager at exactly the driver's version.
+Manager at exactly the driver's version. CRIU retains the primary context of
+every visible GPU while it copies, which takes some GPU memory on each until
+CRIU releases them when it finishes.
 
 `gpu-cs-<pid>.img` starts with the `CUCS` magic, the length of a
 `cuda_cs_image` header (`cuda.proto`) that gives the size and offset of the

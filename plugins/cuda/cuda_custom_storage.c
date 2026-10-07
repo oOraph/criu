@@ -61,6 +61,7 @@ static struct {
 	CUresult (*device_get_count)(int *);
 	CUresult (*device_get)(CUdevice *, int);
 	CUresult (*primary_ctx_retain)(CUcontext *, CUdevice);
+	CUresult (*primary_ctx_release)(CUdevice);
 	CUresult (*ctx_set_current)(CUcontext);
 	CUresult (*ctx_get_device)(CUdevice *);
 	CUresult (*device_get_uuid)(unsigned char *, CUdevice);
@@ -73,6 +74,7 @@ static struct {
 	CUresult (*memcpy_dtoh_async)(void *, CUdeviceptr, size_t, CUstream);
 	CUresult (*memcpy_htod_async)(CUdeviceptr, const void *, size_t, CUstream);
 	CUresult (*event_create)(CUevent *, unsigned);
+	CUresult (*event_destroy)(CUevent);
 	CUresult (*event_record)(CUevent, CUstream);
 	CUresult (*event_synchronize)(CUevent);
 	CUresult (*operation_complete)(CUcheckpointOperationHandle);
@@ -88,14 +90,19 @@ static const char *cs_err(CUresult r)
 	return s;
 }
 
-static void *cs_resolve(void *h, const char *name)
+/*
+ * Resolve every symbol through cuGetProcAddress at the custom-storage ABI
+ * version: dlsym returns the oldest ABI of a versioned symbol (the
+ * 2-argument cuStreamGetCtx, the parent-GPU cuDeviceGetUuid, ...).
+ */
+static void *cs_resolve(const char *name)
 {
 	void *fn = NULL;
 	int q;
 
-	if (cs.get_proc_address && cs.get_proc_address(name, &fn, CS_CUDA_VERSION, 0, &q) == CUDA_SUCCESS && fn)
-		return fn;
-	return dlsym(h, name);
+	if (cs.get_proc_address(name, &fn, CS_CUDA_VERSION, 0, &q) != CUDA_SUCCESS)
+		return NULL;
+	return fn;
 }
 
 int cuda_cs_init(void *h)
@@ -103,17 +110,19 @@ int cuda_cs_init(void *h)
 	cs_available = false;
 	if (!h)
 		return -EINVAL;
-	cs.get_proc_address = dlsym(h, "cuGetProcAddress_v2");
-	if (!cs.get_proc_address)
-		cs.get_proc_address = dlsym(h, "cuGetProcAddress");
 	cs.operation_complete = dlsym(h, "cuCheckpointOperationComplete");
 	if (!cs.operation_complete) {
 		pr_debug("libcuda has no cuCheckpointOperationComplete: custom storage unavailable\n");
 		return -ENOTSUP;
 	}
+	cs.get_proc_address = dlsym(h, "cuGetProcAddress_v2");
+	if (!cs.get_proc_address) {
+		pr_err("libcuda has cuCheckpointOperationComplete but no cuGetProcAddress_v2\n");
+		return -ENOENT;
+	}
 #define R(field, name)                                                       \
 	do {                                                                 \
-		cs.field = cs_resolve(h, name);                              \
+		cs.field = cs_resolve(name);                                 \
 		if (!cs.field) {                                             \
 			pr_err("Unable to resolve %s from libcuda\n", name); \
 			return -ENOENT;                                      \
@@ -123,8 +132,13 @@ int cuda_cs_init(void *h)
 	R(device_get_count, "cuDeviceGetCount");
 	R(device_get, "cuDeviceGet");
 	R(primary_ctx_retain, "cuDevicePrimaryCtxRetain");
+	R(primary_ctx_release, "cuDevicePrimaryCtxRelease");
 	R(ctx_set_current, "cuCtxSetCurrent");
 	R(ctx_get_device, "cuCtxGetDevice");
+	/* the instance's UUID for a MIG instance, not its parent GPU's */
+	R(device_get_uuid, "cuDeviceGetUuid");
+	/* the 3-argument ABI, which also reports a green context */
+	R(stream_get_ctx, "cuStreamGetCtx");
 	R(stream_create, "cuStreamCreate");
 	R(stream_destroy, "cuStreamDestroy");
 	R(stream_synchronize, "cuStreamSynchronize");
@@ -133,37 +147,10 @@ int cuda_cs_init(void *h)
 	R(memcpy_dtoh_async, "cuMemcpyDtoHAsync");
 	R(memcpy_htod_async, "cuMemcpyHtoDAsync");
 	R(event_create, "cuEventCreate");
+	R(event_destroy, "cuEventDestroy");
 	R(event_record, "cuEventRecord");
 	R(event_synchronize, "cuEventSynchronize");
 #undef R
-	/* only the 3-argument ABI: never fall back to dlsym("cuStreamGetCtx"), the 2-argument one */
-	{
-		void *fn = NULL;
-		int q;
-
-		if (!cs.get_proc_address ||
-		    cs.get_proc_address("cuStreamGetCtx", &fn, CS_CUDA_VERSION, 0, &q) != CUDA_SUCCESS || !fn)
-			fn = dlsym(h, "cuStreamGetCtx_v2");
-		if (!fn) {
-			pr_err("Unable to resolve cuStreamGetCtx_v2 from libcuda\n");
-			return -ENOENT;
-		}
-		cs.stream_get_ctx = fn;
-	}
-	/* cuDeviceGetUuid returns only the parent GPU of a MIG instance; _v2 is the instance's. */
-	{
-		void *fn = NULL;
-		int q;
-
-		if (!cs.get_proc_address ||
-		    cs.get_proc_address("cuDeviceGetUuid", &fn, CS_CUDA_VERSION, 0, &q) != CUDA_SUCCESS || !fn)
-			fn = dlsym(h, "cuDeviceGetUuid_v2");
-		if (!fn) {
-			pr_err("Unable to resolve cuDeviceGetUuid_v2 from libcuda\n");
-			return -ENOENT;
-		}
-		cs.device_get_uuid = fn;
-	}
 	cs_available = true;
 	pr_info("custom-storage checkpoint API available\n");
 	return 0;
@@ -189,6 +176,10 @@ int cuda_cs_check_restore(int pid)
 	return 0;
 }
 
+/* The devices whose primary context CRIU retains, released by cuda_cs_fini(). */
+static CUdevice *cs_retained;
+static int cs_nr_retained;
+
 int cuda_cs_prepare(void)
 {
 	int n, i;
@@ -201,6 +192,9 @@ int cuda_cs_prepare(void)
 		pr_err("cuDeviceGetCount: %s\n", cs_err(r));
 		return -1;
 	}
+	cs_retained = calloc(n ?: 1, sizeof(*cs_retained));
+	if (!cs_retained)
+		return -1;
 	for (i = 0; i < n; i++) {
 		CUdevice d;
 		CUcontext c;
@@ -208,9 +202,20 @@ int cuda_cs_prepare(void)
 			pr_err("Unable to retain primary context of device %d: %s\n", i, cs_err(r));
 			return -1;
 		}
+		cs_retained[cs_nr_retained++] = d;
 	}
 	cs_prepared = true;
 	return 0;
+}
+
+void cuda_cs_fini(void)
+{
+	/* A primary context holds GPU memory that the restored tasks may need. */
+	while (cs_nr_retained)
+		cs.primary_ctx_release(cs_retained[--cs_nr_retained]);
+	free(cs_retained);
+	cs_retained = NULL;
+	cs_prepared = false;
 }
 
 int cuda_cs_complete(CUcheckpointOperationHandle handle)
@@ -223,20 +228,24 @@ int cuda_cs_complete(CUcheckpointOperationHandle handle)
 	return 0;
 }
 
+/* The pid of a task in its own pid namespace: the last NSpid field. */
 static int cs_ns_pid(int pid)
 {
 	char path[64], line[256];
-	int ns = pid;
+	int ns = -1;
 	FILE *f;
 
 	snprintf(path, sizeof(path), "/proc/%d/status", pid);
 	f = fopen(path, "r");
-	if (!f)
-		return pid;
+	if (!f) {
+		pr_perror("Unable to open %s", path);
+		return -1;
+	}
 	while (fgets(line, sizeof(line), f)) {
 		if (!strncmp(line, "NSpid:", 6)) {
-			char *p = line + 6, *last = NULL, *tok;
-			for (tok = strtok(p, " \t\n"); tok; tok = strtok(NULL, " \t\n"))
+			char *p = line + 6, *last = NULL, *tok, *save;
+
+			for (tok = strtok_r(p, " \t\n", &save); tok; tok = strtok_r(NULL, " \t\n", &save))
 				last = tok;
 			if (last)
 				ns = atoi(last);
@@ -244,19 +253,27 @@ static int cs_ns_pid(int pid)
 		}
 	}
 	fclose(f);
+	if (ns <= 0)
+		pr_err("Unable to find the namespace pid of %d\n", pid);
 	return ns;
 }
 
-static void cs_image_name(int pid, char *buf, size_t len)
+static int cs_image_name(int pid, char *buf, size_t len)
 {
-	snprintf(buf, len, "gpu-cs-%d.img", cs_ns_pid(pid));
+	int ns = cs_ns_pid(pid);
+
+	if (ns <= 0)
+		return -1;
+	snprintf(buf, len, "gpu-cs-%d.img", ns);
+	return 0;
 }
 
 int cuda_cs_image_exists(int pid, int img_dir_fd)
 {
 	char fname[64];
 
-	cs_image_name(pid, fname, sizeof(fname));
+	if (cs_image_name(pid, fname, sizeof(fname)))
+		return -1;
 	if (!faccessat(img_dir_fd, fname, F_OK, 0))
 		return 1;
 	if (errno == ENOENT)
@@ -269,7 +286,8 @@ int cuda_cs_image_remove(int pid, int img_dir_fd)
 {
 	char fname[64];
 
-	cs_image_name(pid, fname, sizeof(fname));
+	if (cs_image_name(pid, fname, sizeof(fname)))
+		return -1;
 	if (unlinkat(img_dir_fd, fname, 0) && errno != ENOENT) {
 		pr_perror("Unable to remove stale %s", fname);
 		return -1;
@@ -313,7 +331,44 @@ struct cs_xfer {
 struct cs_warg {
 	struct cs_xfer *x;
 	int id;
+	void **buf; /* its two pinned buffers */
 };
+
+/* Pinned buffers of the workers, allocated once for all the regions of a transfer. */
+struct cs_pool {
+	void *buf[CS_MAXTHR][2];
+};
+
+static int cs_pool_get(struct cs_pool *pool, int n)
+{
+	CUresult r;
+	int i, b;
+
+	for (i = 0; i < n; i++) {
+		for (b = 0; b < 2; b++) {
+			if (pool->buf[i][b])
+				continue;
+			r = cs.mem_host_alloc(&pool->buf[i][b], CS_CHUNK, 1 /* CU_MEMHOSTALLOC_PORTABLE */);
+			if (r != CUDA_SUCCESS) {
+				pool->buf[i][b] = NULL;
+				pr_err("cuMemHostAlloc: %s\n", cs_err(r));
+				return -1;
+			}
+		}
+	}
+	return 0;
+}
+
+static void cs_pool_put(struct cs_pool *pool)
+{
+	int i, b;
+
+	for (i = 0; i < CS_MAXTHR; i++)
+		for (b = 0; b < 2; b++)
+			if (pool->buf[i][b])
+				cs.mem_free_host(pool->buf[i][b]);
+	memset(pool, 0, sizeof(*pool));
+}
 
 /* A failed copy may only be reported by a later synchronisation: check every call. */
 #define CS_CALL(call, name)                                                 \
@@ -353,7 +408,7 @@ static void *cs_worker(void *p)
 {
 	struct cs_warg *w = p;
 	struct cs_xfer *x = w->x;
-	void *buf[2] = { NULL, NULL };
+	void **buf = w->buf;
 	CUevent ev[2] = { NULL, NULL };
 	CUstream st = NULL;
 	int inflight[2] = { 0, 0 };
@@ -365,7 +420,6 @@ static void *cs_worker(void *p)
 	CS_CALL(cs.ctx_set_current(x->ctx), "cuCtxSetCurrent");
 	CS_CALL(cs.stream_create(&st, 1 /* CU_STREAM_NON_BLOCKING */), "cuStreamCreate");
 	for (i = 0; i < 2; i++) {
-		CS_CALL(cs.mem_host_alloc(&buf[i], CS_CHUNK, 1 /* CU_MEMHOSTALLOC_PORTABLE */), "cuMemHostAlloc");
 		CS_CALL(cs.event_create(&ev[i], 2 /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
 	}
 
@@ -419,8 +473,8 @@ out:
 		cs.stream_destroy(st);
 	}
 	for (i = 0; i < 2; i++)
-		if (buf[i])
-			cs.mem_free_host(buf[i]);
+		if (ev[i])
+			cs.event_destroy(ev[i]);
 	return NULL;
 }
 #undef CS_CALL
@@ -510,12 +564,13 @@ static int cs_find_source(const unsigned char new_uuid[16], const unsigned char 
 }
 
 static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomStoragePerDeviceData *d, bool restore,
-			  bool direct)
+			  bool direct, struct cs_pool *pool)
 {
 	struct cs_xfer x;
 	struct cs_warg wa[CS_MAXTHR];
 	pthread_t th[CS_MAXTHR];
 	CUcontext ctx = NULL;
+	const char *dest;
 	CUresult r;
 	double t0;
 	int n, i;
@@ -538,10 +593,13 @@ static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomS
 	n = cs_threads();
 	if ((size_t)n > x.nchunks)
 		n = (int)x.nchunks;
+	if (cs_pool_get(pool, n))
+		return -1;
 	t0 = cs_now_ms();
 	for (i = 0; i < n; i++) {
 		wa[i].x = &x;
 		wa[i].id = i;
+		wa[i].buf = pool->buf[i];
 		errno = pthread_create(&th[i], NULL, cs_worker, &wa[i]);
 		if (errno) {
 			pr_perror("pthread_create");
@@ -556,9 +614,13 @@ static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomS
 		pr_err("cuStreamSynchronize on the mapping's stream: %s\n", cs_err(r));
 		atomic_store(&x.err, 1);
 	}
+	if (mem)
+		dest = "host memory";
+	else
+		dest = direct ? "O_DIRECT" : "buffered";
 	pr_info("[timing] custom-storage %s: %.2f GB, %d threads, %.0f ms (%.1f GB/s, %s)\n",
 		restore ? "restore copy" : "checkpoint copy", d->size / 1e9, n, cs_now_ms() - t0,
-		d->size / (cs_now_ms() - t0) / 1e6, mem ? "host memory" : direct ? "O_DIRECT" : "buffered");
+		d->size / (cs_now_ms() - t0) / 1e6, dest);
 	return atomic_load(&x.err) ? -1 : 0;
 }
 
@@ -665,6 +727,7 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 	CudaCsRegion regions[CS_MAXDEV];
 	unsigned char uuids[CS_MAXDEV][16], old[CS_MAXDEV][16];
 	bool used[CS_MAXDEV] = {};
+	struct cs_pool pool = {};
 	CudaCsImage *img = NULL;
 	void *hb = NULL;
 	unsigned int i;
@@ -678,7 +741,8 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 		pr_err("No image directory for the custom-storage image of pid %d\n", pid);
 		return -1;
 	}
-	cs_image_name(pid, fname, sizeof(fname));
+	if (cs_image_name(pid, fname, sizeof(fname)))
+		return -1;
 	fd = openat(img_dir_fd, fname, flags | O_DIRECT, 0600);
 	if (fd < 0 && errno == EINVAL) {
 		direct = false;
@@ -726,7 +790,7 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 			       (unsigned long long)r->size, d->size);
 			goto out;
 		}
-		if (cs_xfer_region(fd, NULL, r->offset, d, restore, direct))
+		if (cs_xfer_region(fd, NULL, r->offset, d, restore, direct, &pool))
 			goto out;
 	}
 	/* O_DIRECT bypasses the page cache, not the device's write cache. */
@@ -736,6 +800,7 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 	}
 	ret = 0;
 out:
+	cs_pool_put(&pool);
 	if (img)
 		cuda_cs_image__free_unpacked(img, NULL);
 	free(hb);
@@ -753,6 +818,7 @@ struct cuda_cs_rescue {
 
 struct cuda_cs_rescue *cuda_cs_rescue_save(CUcheckpointCustomStorageInfo *info)
 {
+	struct cs_pool pool = {};
 	struct cuda_cs_rescue *r;
 	size_t off = 0;
 	unsigned int i;
@@ -778,12 +844,14 @@ struct cuda_cs_rescue *cuda_cs_rescue_save(CUcheckpointCustomStorageInfo *info)
 		return NULL;
 	}
 	for (i = 0; i < r->ndev; i++) {
-		if (cs_xfer_region(-1, r->mem, off, &info->perDeviceData[i], false, false)) {
+		if (cs_xfer_region(-1, r->mem, off, &info->perDeviceData[i], false, false, &pool)) {
+			cs_pool_put(&pool);
 			cuda_cs_rescue_free(r);
 			return NULL;
 		}
 		off += r->size[i];
 	}
+	cs_pool_put(&pool);
 	pr_info("Kept %zu bytes of GPU memory in host memory for the rollback\n", r->len);
 	return r;
 }
@@ -791,8 +859,10 @@ struct cuda_cs_rescue *cuda_cs_rescue_save(CUcheckpointCustomStorageInfo *info)
 int cuda_cs_rescue_restore(struct cuda_cs_rescue *r, CUcheckpointCustomStorageInfo *info)
 {
 	bool used[CS_MAXDEV] = {};
+	struct cs_pool pool = {};
 	size_t off[CS_MAXDEV];
 	unsigned int i;
+	int ret = -1;
 
 	if (!info || info->deviceCount != r->ndev) {
 		pr_err("The driver maps %u devices to restore, %u were kept\n", info ? info->deviceCount : 0, r->ndev);
@@ -806,19 +876,22 @@ int cuda_cs_rescue_restore(struct cuda_cs_rescue *r, CUcheckpointCustomStorageIn
 		int src;
 
 		if (cs_region_uuid(d, uuid))
-			return -1;
+			goto out;
 		src = cs_find_source(uuid, r->uuid, r->ndev, used, NULL, 0);
 		if (src < 0)
-			return -1;
+			goto out;
 		if (d->size != r->size[src]) {
 			pr_err("Device %u: the driver maps %zu bytes to restore, %zu were kept\n", i, d->size,
 			       r->size[src]);
-			return -1;
+			goto out;
 		}
-		if (cs_xfer_region(-1, r->mem, off[src], d, true, false))
-			return -1;
+		if (cs_xfer_region(-1, r->mem, off[src], d, true, false, &pool))
+			goto out;
 	}
-	return 0;
+	ret = 0;
+out:
+	cs_pool_put(&pool);
+	return ret;
 }
 
 void cuda_cs_rescue_free(struct cuda_cs_rescue *r)
