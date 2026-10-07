@@ -46,8 +46,13 @@ int cuda_cs_image_exists(int pid, int img_dir_fd);
 int cuda_cs_image_remove(int pid, int img_dir_fd);
 /* Retain the primary context of every device (required by the mode); call after cuInit(). */
 int cuda_cs_prepare(void);
-/* Copy the mapped regions to (restore=false) or from (restore=true) gpu-cs-<nspid>.img in img_dir_fd. */
-int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_fd, bool restore);
+/*
+ * Copy the mapped regions to (restore=false) or from (restore=true) gpu-cs-<nspid>.img in img_dir_fd.
+ * On restore, each region gets the memory of the GPU that pairs (the device map, old to new UUID) maps
+ * to its GPU, or of its own GPU without a pair.
+ */
+int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_fd, bool restore,
+		     const CUcheckpointGpuPair *pairs, unsigned int npairs);
 /*
  * The driver has no way to cancel a custom-storage checkpoint: once it is
  * completed, the GPU memory exists only where CRIU copied it. If the image

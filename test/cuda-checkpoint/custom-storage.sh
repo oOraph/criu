@@ -124,6 +124,7 @@ CS_THREADS=1
 dump "$WORK_DIR/one" "$MOCK_DIR/custom-storage" auto || fail "1 worker: dump failed"
 CS_THREADS=
 grep -q "custom-storage checkpoint copy: .*, 1 threads," "$WORK_DIR/one/dump.log" || fail "1 worker: dump not 1 thread"
+ONE_PID=$TARGET_PID
 ONE_IMAGE="$WORK_DIR/one/gpu-cs-$TARGET_PID.img"
 [ "$(head -c 4 "$ONE_IMAGE")" = CUCS ] || fail "image: no CUCS magic"
 # The first device ends inside its last 4 KiB block, after a full chunk went through the same buffer:
@@ -148,6 +149,24 @@ if criu restore "$WORK_DIR/version" "$MOCK_DIR/custom-storage" --restore-detache
 	fail "version: restore succeeded"
 fi
 grep -q "unsupported version 2" "$WORK_DIR/version/restore.log" || fail "version: missing error"
+
+# The driver may list the devices in any order, and a restore may move the task to other GPUs, as when a
+# container gets another GPU: each device's memory goes to the GPU the device map gives for its own.
+rm -f "$WORK_DIR/gpu-out"
+if ! CRIU_CUDA_MOCK_CS_REVERSE=1 CRIU_CUDA_MOCK_UUID_OFFSET=64 criu restore "$WORK_DIR/one" \
+	"$MOCK_DIR/custom-storage" --restore-detached --plugin-option cuda_plugin.device-map=0=1,1=0,2=2,3=3; then
+	fail "remap: restore failed"
+fi
+TARGET_PID=$ONE_PID
+stop_target
+TARGET_PID=
+cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "remap: GPU memory restored on the wrong GPUs"
+# Without a device map, other GPUs have no checkpointed memory.
+if CRIU_CUDA_MOCK_UUID_OFFSET=64 criu restore "$WORK_DIR/one" "$MOCK_DIR/custom-storage" --restore-detached; then
+	fail "other GPUs: restore succeeded"
+fi
+grep -q "has no checkpointed memory; restoring on other GPUs needs cuda_plugin.device-map" \
+	"$WORK_DIR/one/restore.log" || fail "other GPUs: missing error"
 
 # off: the API is there but must not be used.
 dump "$WORK_DIR/off" "$MOCK_DIR/custom-storage" off || fail "off: dump failed"

@@ -24,6 +24,12 @@
  * when a restore completes, so the test can compare the two files.
  * CRIU_CUDA_MOCK_CS_SYNC_ERROR makes the synchronisations fail, as they do
  * when an asynchronous copy failed.
+ *
+ * Device i's memory is on GPU i at checkpoint. On restore, it goes to the GPU
+ * that the device map gives for the dumping host's GPU i (whose UUIDs start at
+ * CRIU_CUDA_MOCK_CS_DUMP_UUID_OFFSET), and CRIU_CUDA_MOCK_CS_REVERSE lists the
+ * devices in reverse order: the output only matches if CRIU moved each
+ * device's memory to the GPU of its region.
  */
 
 #define MOCK_CUDA_SUCCESS	      0
@@ -242,27 +248,32 @@ mock_cuda_result_t cuDeviceGetUuid(void *uuid, int device)
 	return MOCK_CUDA_SUCCESS;
 }
 
-mock_cuda_result_t cuDeviceGetUuid_v2(void *uuid, int device)
+/* UUID of GPU ordinal on a host whose UUIDs start at the offset in the environment variable name. */
+static int mock_uuid(const char *name, int ordinal, unsigned char *bytes)
 {
-	const char *offset_value = getenv("CRIU_CUDA_MOCK_UUID_OFFSET");
-	unsigned char *bytes = uuid;
+	const char *offset_value = getenv(name);
 	unsigned long offset = 0;
 	char *end = NULL;
 	unsigned int i;
-
-	if (!uuid || device < MOCK_DEVICE_HANDLE_BASE || device >= MOCK_DEVICE_HANDLE_BASE + MOCK_GPU_COUNT)
-		return MOCK_CUDA_ERROR_INVALID_VALUE;
-	device -= MOCK_DEVICE_HANDLE_BASE;
 
 	if (offset_value) {
 		errno = 0;
 		offset = strtoul(offset_value, &end, 0);
 		if (errno || end == offset_value || *end || offset > 0xff)
-			return MOCK_CUDA_ERROR_INVALID_VALUE;
+			return -1;
 	}
 
 	for (i = 0; i < 16; i++)
-		bytes[i] = (unsigned char)(offset + (unsigned int)device * 16 + i);
+		bytes[i] = (unsigned char)(offset + (unsigned int)ordinal * 16 + i);
+	return 0;
+}
+
+mock_cuda_result_t cuDeviceGetUuid_v2(void *uuid, int device)
+{
+	if (!uuid || device < MOCK_DEVICE_HANDLE_BASE || device >= MOCK_DEVICE_HANDLE_BASE + MOCK_GPU_COUNT)
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
+	if (mock_uuid("CRIU_CUDA_MOCK_UUID_OFFSET", device - MOCK_DEVICE_HANDLE_BASE, uuid))
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
 	return MOCK_CUDA_SUCCESS;
 }
 
@@ -417,11 +428,35 @@ struct mock_cs_info {
 };
 
 static struct mock_cs_device cs_devices[MOCK_GPU_COUNT];
+static char cs_ctx[MOCK_GPU_COUNT]; /* the primary context of each GPU */
+static int cs_gpu[MOCK_GPU_COUNT];  /* the GPU of each device */
 static struct mock_cs_info cs_info = { &cs_info, cs_devices, 0 };
 static char *cs_buf;
 static size_t cs_size;
 static bool cs_restoring;
 static __thread void *current_ctx; /* copies need a context set in the calling thread */
+
+/* GPU ordinal that a restore with this device map puts the dumping host's GPU i on. */
+static int mock_cs_restore_gpu(const struct mock_cuda_restore_args *args, int i)
+{
+	unsigned char old_uuid[16], new_uuid[16];
+	unsigned int p;
+	int j;
+
+	if (!args->gpu_pairs_count)
+		return i;
+	if (mock_uuid("CRIU_CUDA_MOCK_CS_DUMP_UUID_OFFSET", i, old_uuid))
+		return -1;
+	for (p = 0; p < args->gpu_pairs_count; p++) {
+		if (memcmp(args->gpu_pairs[p].old_uuid, old_uuid, 16))
+			continue;
+		for (j = 0; j < MOCK_GPU_COUNT; j++)
+			if (!mock_uuid("CRIU_CUDA_MOCK_UUID_OFFSET", j, new_uuid) &&
+			    !memcmp(args->gpu_pairs[p].new_uuid, new_uuid, 16))
+				return j;
+	}
+	return -1;
+}
 
 /* customStorageInfo_out is at offset 0 of the checkpoint args, 16 of the restore args. */
 static int mock_cs_begin(bool restore, void *args, size_t out_offset)
@@ -447,8 +482,12 @@ static int mock_cs_begin(bool restore, void *args, size_t out_offset)
 	fclose(file);
 	for (i = 0; i < n; i++) {
 		size_t start = size * i / n, end = size * (i + 1) / n;
+		int k = restore && getenv("CRIU_CUDA_MOCK_CS_REVERSE") ? n - 1 - i : i;
 
-		cs_devices[i] = (struct mock_cs_device){ (uintptr_t)(buf + start), end - start, &cs_devices[i] };
+		cs_devices[k] = (struct mock_cs_device){ (uintptr_t)(buf + start), end - start, &cs_devices[k] };
+		cs_gpu[k] = restore ? mock_cs_restore_gpu(args, i) : i;
+		if (cs_gpu[k] < 0)
+			return -1;
 	}
 	cs_info.device_count = n;
 	cs_buf = buf;
@@ -494,7 +533,19 @@ mock_cuda_result_t cuStreamSynchronize(void *stream)
 
 mock_cuda_result_t cuDevicePrimaryCtxRetain(void **ctx, int device)
 {
-	*ctx = &cs_info;
+	if (device < MOCK_DEVICE_HANDLE_BASE || device >= MOCK_DEVICE_HANDLE_BASE + MOCK_GPU_COUNT)
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
+	*ctx = &cs_ctx[device - MOCK_DEVICE_HANDLE_BASE];
+	return MOCK_CUDA_SUCCESS;
+}
+
+mock_cuda_result_t cuCtxGetDevice(int *device)
+{
+	char *ctx = current_ctx;
+
+	if (ctx < cs_ctx || ctx >= cs_ctx + MOCK_GPU_COUNT)
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
+	*device = MOCK_DEVICE_HANDLE_BASE + (int)(ctx - cs_ctx);
 	return MOCK_CUDA_SUCCESS;
 }
 
@@ -542,7 +593,11 @@ mock_cuda_result_t cuMemcpyHtoDAsync(unsigned long long dst, const void *src, si
 /* Only the 3-argument cuStreamGetCtx_v2 exists; the plugin must get it through cuGetProcAddress. */
 static mock_cuda_result_t stream_get_ctx_v2(void *stream, void **ctx, void **green_ctx)
 {
-	*ctx = &cs_info;
+	struct mock_cs_device *d = stream;
+
+	if (d < cs_devices || d >= cs_devices + MOCK_GPU_COUNT)
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
+	*ctx = &cs_ctx[cs_gpu[d - cs_devices]];
 	*green_ctx = NULL;
 	return MOCK_CUDA_SUCCESS;
 }

@@ -666,7 +666,7 @@ static int checkpoint_device(void *arg)
 			pr_err("Driver returned no custom storage info for pid %d\n", pid);
 			ret = -1;
 		} else {
-			if (cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), false)) {
+			if (cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), false, NULL, 0)) {
 				ret = -1;
 				/* Free the disk first: it may be full. */
 				cuda_cs_image_remove(pid, criu_get_image_dir());
@@ -958,7 +958,8 @@ static int restore_device(void *arg)
 						if (op->cs_rescue)
 							err = cuda_cs_rescue_restore(op->cs_rescue, cs_info);
 						else
-							err = cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), true);
+							err = cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), true,
+									       args.gpuPairs, args.gpuPairsCount);
 						if (cuda_cs_complete(cs_info->handle))
 							err = -1;
 						if (err) {

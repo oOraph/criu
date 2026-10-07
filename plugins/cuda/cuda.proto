@@ -24,6 +24,9 @@ message cuda_cs_region {
 	optional uint64 size = 1;
 	// Offset in the file, a multiple of 4096.
 	optional uint64 offset = 2;
+	// Raw 16-byte UUID of the GPU it was on: restore puts it on the GPU
+	// that the device map gives for this one, whatever the driver's order.
+	optional bytes uuid = 3;
 }
 
 message cuda_cs_image {

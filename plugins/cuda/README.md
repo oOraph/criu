@@ -165,6 +165,9 @@ it. It is written next to the other images even with `--page-server`, and
 custom storage is not used with `--stream`. Restore follows the image: with a
 `gpu-cs-<pid>.img`, it needs the Driver API backend and a driver with the
 custom-storage API; without one, it restores the GPU memory the regular way.
+The image records the UUID of the GPU each device's memory was on, and
+restore puts it on the GPU that `cuda_plugin.device-map` gives for that one,
+or on the same GPU without a map, whatever order the driver lists them in.
 
 ## GPU device mapping
 

@@ -62,6 +62,8 @@ static struct {
 	CUresult (*device_get)(CUdevice *, int);
 	CUresult (*primary_ctx_retain)(CUcontext *, CUdevice);
 	CUresult (*ctx_set_current)(CUcontext);
+	CUresult (*ctx_get_device)(CUdevice *);
+	CUresult (*device_get_uuid)(unsigned char *, CUdevice);
 	CUresult (*stream_get_ctx)(CUstream, CUcontext *, void ** /* CUgreenCtx */);
 	CUresult (*stream_create)(CUstream *, unsigned);
 	CUresult (*stream_destroy)(CUstream);
@@ -122,6 +124,7 @@ int cuda_cs_init(void *h)
 	R(device_get, "cuDeviceGet");
 	R(primary_ctx_retain, "cuDevicePrimaryCtxRetain");
 	R(ctx_set_current, "cuCtxSetCurrent");
+	R(ctx_get_device, "cuCtxGetDevice");
 	R(stream_create, "cuStreamCreate");
 	R(stream_destroy, "cuStreamDestroy");
 	R(stream_synchronize, "cuStreamSynchronize");
@@ -146,6 +149,20 @@ int cuda_cs_init(void *h)
 			return -ENOENT;
 		}
 		cs.stream_get_ctx = fn;
+	}
+	/* cuDeviceGetUuid returns only the parent GPU of a MIG instance; _v2 is the instance's. */
+	{
+		void *fn = NULL;
+		int q;
+
+		if (!cs.get_proc_address ||
+		    cs.get_proc_address("cuDeviceGetUuid", &fn, CS_CUDA_VERSION, 0, &q) != CUDA_SUCCESS || !fn)
+			fn = dlsym(h, "cuDeviceGetUuid_v2");
+		if (!fn) {
+			pr_err("Unable to resolve cuDeviceGetUuid_v2 from libcuda\n");
+			return -ENOENT;
+		}
+		cs.device_get_uuid = fn;
 	}
 	cs_available = true;
 	pr_info("custom-storage checkpoint API available\n");
@@ -408,6 +425,90 @@ out:
 }
 #undef CS_CALL
 
+/* Make the context of a mapped region current; the mapped pointer has none, its stream does. */
+static int cs_region_ctx(CUcheckpointCustomStoragePerDeviceData *d, CUcontext *ctx)
+{
+	void *green = NULL;
+	CUresult r;
+
+	*ctx = NULL;
+	if ((r = cs.stream_get_ctx(d->stream, ctx, &green)) != CUDA_SUCCESS) {
+		pr_err("Unable to get the mapping's context: %s\n", cs_err(r));
+		return -1;
+	}
+	if (!*ctx) {
+		pr_err("The mapping's stream has no regular context (green context %p)\n", green);
+		return -1;
+	}
+	if ((r = cs.ctx_set_current(*ctx)) != CUDA_SUCCESS) {
+		pr_err("Unable to set the mapping's context: %s\n", cs_err(r));
+		return -1;
+	}
+	return 0;
+}
+
+/* UUID of the GPU a mapped region is on. */
+static int cs_region_uuid(CUcheckpointCustomStoragePerDeviceData *d, unsigned char uuid[16])
+{
+	CUcontext ctx;
+	CUdevice dev;
+	CUresult r;
+
+	if (cs_region_ctx(d, &ctx))
+		return -1;
+	if ((r = cs.ctx_get_device(&dev)) != CUDA_SUCCESS || (r = cs.device_get_uuid(uuid, dev)) != CUDA_SUCCESS) {
+		pr_err("Unable to get the GPU of a mapped region: %s\n", cs_err(r));
+		return -1;
+	}
+	return 0;
+}
+
+static const char *cs_uuid_str(const unsigned char uuid[16], char buf[33])
+{
+	int i;
+
+	for (i = 0; i < 16; i++)
+		sprintf(buf + 2 * i, "%02x", uuid[i]);
+	return buf;
+}
+
+/*
+ * The driver gives no order for the regions it maps, and a restore can move
+ * the task to other GPUs (pairs: the device map). Find the checkpointed region
+ * whose memory goes to the GPU new_uuid; used[] rejects mapping one twice.
+ */
+static int cs_find_source(const unsigned char new_uuid[16], const unsigned char (*old)[16], unsigned int n,
+			  bool *used, const CUcheckpointGpuPair *pairs, unsigned int npairs)
+{
+	const unsigned char *want = new_uuid;
+	char a[33], b[33];
+	unsigned int i;
+
+	for (i = 0; i < npairs; i++) {
+		if (!memcmp(pairs[i].newUuid, new_uuid, 16)) {
+			want = pairs[i].oldUuid;
+			break;
+		}
+	}
+	for (i = 0; i < n; i++) {
+		if (memcmp(old[i], want, 16))
+			continue;
+		if (used[i]) {
+			pr_err("GPU %s was checkpointed once but is restored twice\n", cs_uuid_str(want, a));
+			return -1;
+		}
+		used[i] = true;
+		return i;
+	}
+	if (want == new_uuid)
+		pr_err("GPU %s has no checkpointed memory; restoring on other GPUs needs cuda_plugin.device-map\n",
+		       cs_uuid_str(new_uuid, a));
+	else
+		pr_err("GPU %s is restored from GPU %s, which has no checkpointed memory\n", cs_uuid_str(new_uuid, a),
+		       cs_uuid_str(want, b));
+	return -1;
+}
+
 static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomStoragePerDeviceData *d, bool restore,
 			  bool direct)
 {
@@ -415,23 +516,12 @@ static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomS
 	struct cs_warg wa[CS_MAXTHR];
 	pthread_t th[CS_MAXTHR];
 	CUcontext ctx = NULL;
-	void *green = NULL;
 	CUresult r;
 	double t0;
 	int n, i;
 
-	if ((r = cs.stream_get_ctx(d->stream, &ctx, &green)) != CUDA_SUCCESS) {
-		pr_err("Unable to get the mapping's context: %s\n", cs_err(r));
+	if (cs_region_ctx(d, &ctx))
 		return -1;
-	}
-	if (!ctx) {
-		pr_err("The mapping's stream has no regular context (green context %p)\n", green);
-		return -1;
-	}
-	if ((r = cs.ctx_set_current(ctx)) != CUDA_SUCCESS) {
-		pr_err("Unable to set the mapping's context: %s\n", cs_err(r));
-		return -1;
-	}
 	memset(&x, 0, sizeof(x));
 	x.fd = fd;
 	x.mem = mem;
@@ -481,7 +571,7 @@ static size_t cs_align(size_t n)
 
 /* Lay the regions out after the header and write it. */
 static int cs_write_header(int fd, void *hb, CUcheckpointCustomStorageInfo *info, CudaCsRegion *regions,
-			   const char *fname)
+			   unsigned char (*uuids)[16], const char *fname)
 {
 	CudaCsRegion *rp[CS_MAXDEV];
 	CudaCsImage img = CUDA_CS_IMAGE__INIT;
@@ -495,6 +585,9 @@ static int cs_write_header(int fd, void *hb, CUcheckpointCustomStorageInfo *info
 		regions[i].has_size = regions[i].has_offset = true;
 		regions[i].size = info->perDeviceData[i].size;
 		regions[i].offset = off;
+		regions[i].has_uuid = true;
+		regions[i].uuid.len = 16;
+		regions[i].uuid.data = uuids[i];
 		off += cs_align(regions[i].size);
 		rp[i] = &regions[i];
 	}
@@ -550,8 +643,9 @@ static CudaCsImage *cs_read_header(int fd, void *hb, const char *fname)
 		goto err;
 	}
 	for (i = 0; i < img->n_regions; i++) {
-		if (!img->regions[i]->has_size || !img->regions[i]->has_offset ||
-		    img->regions[i]->offset % 4096 || img->regions[i]->offset < CS_HDR) {
+		if (!img->regions[i]->has_size || !img->regions[i]->has_offset || !img->regions[i]->has_uuid ||
+		    img->regions[i]->uuid.len != 16 || img->regions[i]->offset % 4096 ||
+		    img->regions[i]->offset < CS_HDR) {
 			pr_err("%s: invalid region %u\n", fname, i);
 			goto err;
 		}
@@ -562,12 +656,15 @@ err:
 	return NULL;
 }
 
-int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_fd, bool restore)
+int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_fd, bool restore,
+		     const CUcheckpointGpuPair *pairs, unsigned int npairs)
 {
 	char fname[64];
 	int fd, flags = restore ? O_RDONLY : (O_WRONLY | O_CREAT | O_TRUNC);
 	bool direct = true;
 	CudaCsRegion regions[CS_MAXDEV];
+	unsigned char uuids[CS_MAXDEV][16], old[CS_MAXDEV][16];
+	bool used[CS_MAXDEV] = {};
 	CudaCsImage *img = NULL;
 	void *hb = NULL;
 	unsigned int i;
@@ -594,9 +691,12 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 	if (posix_memalign(&hb, 4096, CS_HDR))
 		goto out;
 	memset(hb, 0, CS_HDR);
+	for (i = 0; i < info->deviceCount; i++)
+		if (cs_region_uuid(&info->perDeviceData[i], uuids[i]))
+			goto out;
 
 	if (!restore) {
-		if (cs_write_header(fd, hb, info, regions, fname))
+		if (cs_write_header(fd, hb, info, regions, uuids, fname))
 			goto out;
 	} else {
 		img = cs_read_header(fd, hb, fname);
@@ -606,12 +706,21 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 			pr_err("%s holds %zu devices, the driver maps %u\n", fname, img->n_regions, info->deviceCount);
 			goto out;
 		}
+		for (i = 0; i < img->n_regions; i++)
+			memcpy(old[i], img->regions[i]->uuid.data, 16);
 	}
 
 	for (i = 0; i < info->deviceCount; i++) {
 		CUcheckpointCustomStoragePerDeviceData *d = &info->perDeviceData[i];
-		CudaCsRegion *r = restore ? img->regions[i] : &regions[i];
+		CudaCsRegion *r = &regions[i];
 
+		if (restore) {
+			int src = cs_find_source(uuids[i], old, img->n_regions, used, pairs, npairs);
+
+			if (src < 0)
+				goto out;
+			r = img->regions[src];
+		}
 		if (d->size != r->size) {
 			pr_err("%s: device %u size mismatch (image %llu, driver %zu)\n", fname, i,
 			       (unsigned long long)r->size, d->size);
@@ -639,6 +748,7 @@ struct cuda_cs_rescue {
 	size_t len;
 	unsigned int ndev;
 	size_t size[CS_MAXDEV];
+	unsigned char uuid[CS_MAXDEV][16];
 };
 
 struct cuda_cs_rescue *cuda_cs_rescue_save(CUcheckpointCustomStorageInfo *info)
@@ -656,6 +766,10 @@ struct cuda_cs_rescue *cuda_cs_rescue_save(CUcheckpointCustomStorageInfo *info)
 	for (i = 0; i < r->ndev; i++) {
 		r->size[i] = info->perDeviceData[i].size;
 		r->len += r->size[i];
+		if (cs_region_uuid(&info->perDeviceData[i], r->uuid[i])) {
+			free(r);
+			return NULL;
+		}
 	}
 	r->mem = mmap(NULL, r->len ?: 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (r->mem == MAP_FAILED) {
@@ -676,22 +790,33 @@ struct cuda_cs_rescue *cuda_cs_rescue_save(CUcheckpointCustomStorageInfo *info)
 
 int cuda_cs_rescue_restore(struct cuda_cs_rescue *r, CUcheckpointCustomStorageInfo *info)
 {
-	size_t off = 0;
+	bool used[CS_MAXDEV] = {};
+	size_t off[CS_MAXDEV];
 	unsigned int i;
 
 	if (!info || info->deviceCount != r->ndev) {
 		pr_err("The driver maps %u devices to restore, %u were kept\n", info ? info->deviceCount : 0, r->ndev);
 		return -1;
 	}
+	for (i = 0; i < r->ndev; i++)
+		off[i] = i ? off[i - 1] + r->size[i - 1] : 0;
 	for (i = 0; i < r->ndev; i++) {
-		if (info->perDeviceData[i].size != r->size[i]) {
-			pr_err("Device %u: the driver maps %zu bytes to restore, %zu were kept\n", i,
-			       info->perDeviceData[i].size, r->size[i]);
+		CUcheckpointCustomStoragePerDeviceData *d = &info->perDeviceData[i];
+		unsigned char uuid[16];
+		int src;
+
+		if (cs_region_uuid(d, uuid))
+			return -1;
+		src = cs_find_source(uuid, r->uuid, r->ndev, used, NULL, 0);
+		if (src < 0)
+			return -1;
+		if (d->size != r->size[src]) {
+			pr_err("Device %u: the driver maps %zu bytes to restore, %zu were kept\n", i, d->size,
+			       r->size[src]);
 			return -1;
 		}
-		if (cs_xfer_region(-1, r->mem, off, &info->perDeviceData[i], true, false))
+		if (cs_xfer_region(-1, r->mem, off[src], d, true, false))
 			return -1;
-		off += r->size[i];
 	}
 	return 0;
 }
