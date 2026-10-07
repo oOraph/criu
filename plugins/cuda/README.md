@@ -158,6 +158,14 @@ transfer threads can be set with the `CUDA_CS_THREADS` environment variable
 concurrent streams). On NVSwitch systems CUDA also needs NVIDIA Fabric
 Manager at exactly the driver's version.
 
+`gpu-cs-<pid>.img` starts with the `CUCS` magic, the length of a
+`cuda_cs_image` header (`cuda.proto`) that gives the size and offset of the
+GPU memory of each device, and then that memory, raw. `crit` does not decode
+it. It is written next to the other images even with `--page-server`, and
+custom storage is not used with `--stream`. Restore follows the image: with a
+`gpu-cs-<pid>.img`, it needs the Driver API backend and a driver with the
+custom-storage API; without one, it restores the GPU memory the regular way.
+
 ## GPU device mapping
 
 During a CUDA dump, the plugin saves the ordinal and UUID of each GPU in the

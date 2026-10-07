@@ -124,11 +124,30 @@ CS_THREADS=1
 dump "$WORK_DIR/one" "$MOCK_DIR/custom-storage" auto || fail "1 worker: dump failed"
 CS_THREADS=
 grep -q "custom-storage checkpoint copy: .*, 1 threads," "$WORK_DIR/one/dump.log" || fail "1 worker: dump not 1 thread"
+ONE_IMAGE="$WORK_DIR/one/gpu-cs-$TARGET_PID.img"
+[ "$(head -c 4 "$ONE_IMAGE")" = CUCS ] || fail "image: no CUCS magic"
+# The first device ends inside its last 4 KiB block, after a full chunk went through the same buffer:
+# the rest of that block is zeroed, not left over from the earlier chunk.
+DEV0_END=$((4096 + $(stat -c %s "$WORK_DIR/gpu-in") / 2))
+PAD=$(((4096 - DEV0_END % 4096) % 4096))
+[ "$PAD" -gt 0 ] || fail "image: the test needs a partial block"
+[ "$(dd if="$ONE_IMAGE" bs=1 skip="$DEV0_END" count="$PAD" status=none | tr -d '\0' | wc -c)" -eq 0 ] ||
+	fail "image: padding not zeroed"
 rm "$WORK_DIR/gpu-out"
 criu restore "$WORK_DIR/one" "$MOCK_DIR/custom-storage" --restore-detached || fail "1 worker: restore failed"
 cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "1 worker: dumped GPU memory differs"
 stop_target
 TARGET_PID=
+
+# An image of an unknown version is rejected. The header payload starts at byte 8 with the version
+# field: 0x08 then its value.
+mkdir "$WORK_DIR/version"
+cp -a "$WORK_DIR/one"/. "$WORK_DIR/version/"
+printf '\002' | dd of="$WORK_DIR/version/$(basename "$ONE_IMAGE")" bs=1 seek=9 conv=notrunc status=none
+if criu restore "$WORK_DIR/version" "$MOCK_DIR/custom-storage" --restore-detached; then
+	fail "version: restore succeeded"
+fi
+grep -q "unsupported version 2" "$WORK_DIR/version/restore.log" || fail "version: missing error"
 
 # off: the API is there but must not be used.
 dump "$WORK_DIR/off" "$MOCK_DIR/custom-storage" off || fail "off: dump failed"

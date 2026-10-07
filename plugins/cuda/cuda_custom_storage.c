@@ -18,8 +18,10 @@
  */
 #include "criu-log.h"
 #include "cuda_custom_storage.h"
+#include "cuda.pb-c.h"
 
 #include <dlfcn.h>
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -40,7 +42,7 @@
 #define CS_CHUNK  (64UL << 20)
 #define CS_MAXTHR 32
 #define CS_HDR	  4096
-#define CS_MAGIC  0x43554353 /* "CUCS" */
+#define CS_MAGIC  "CUCS"
 #define CS_MAXDEV 32
 
 enum cuda_cs_mode cuda_cs_mode = CUDA_CS_AUTO;
@@ -314,6 +316,8 @@ static int cs_store(struct cs_warg *w, void *buf, CUevent ev, size_t off, size_t
 	ssize_t done;
 
 	CS_CALL(cs.event_synchronize(ev), "cuEventSynchronize");
+	/* The O_DIRECT tail of the last chunk would hold the previous chunk's bytes. */
+	memset((char *)buf + len, 0, iolen - len);
 	if (x->mem) {
 		memcpy(x->mem + x->file_off + off, buf, len);
 	} else if ((done = pwrite(x->fd, buf, iolen, x->file_off + off)) != (ssize_t)iolen) {
@@ -468,21 +472,105 @@ static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomS
 	return atomic_load(&x.err) ? -1 : 0;
 }
 
-struct cs_hdr {
-	uint32_t magic;
-	uint32_t ndev;
-	uint64_t size[CS_MAXDEV];
-};
+#define CS_IMAGE_VERSION 1
+
+static size_t cs_align(size_t n)
+{
+	return (n + 4095) & ~4095UL;
+}
+
+/* Lay the regions out after the header and write it. */
+static int cs_write_header(int fd, void *hb, CUcheckpointCustomStorageInfo *info, CudaCsRegion *regions,
+			   const char *fname)
+{
+	CudaCsRegion *rp[CS_MAXDEV];
+	CudaCsImage img = CUDA_CS_IMAGE__INIT;
+	uint32_t len32;
+	size_t len;
+	off_t off = CS_HDR;
+	unsigned int i;
+
+	for (i = 0; i < info->deviceCount; i++) {
+		cuda_cs_region__init(&regions[i]);
+		regions[i].has_size = regions[i].has_offset = true;
+		regions[i].size = info->perDeviceData[i].size;
+		regions[i].offset = off;
+		off += cs_align(regions[i].size);
+		rp[i] = &regions[i];
+	}
+	img.has_version = true;
+	img.version = CS_IMAGE_VERSION;
+	img.n_regions = info->deviceCount;
+	img.regions = rp;
+	len = cuda_cs_image__get_packed_size(&img);
+	if (len > CS_HDR - 8) {
+		pr_err("%s: header of %zu bytes does not fit\n", fname, len);
+		return -1;
+	}
+	len32 = htole32(len);
+	memcpy(hb, CS_MAGIC, 4);
+	memcpy((char *)hb + 4, &len32, 4);
+	cuda_cs_image__pack(&img, (uint8_t *)hb + 8);
+
+	if (pwrite(fd, hb, CS_HDR, 0) != CS_HDR) {
+		pr_perror("Unable to write %s header", fname);
+		return -1;
+	}
+	return 0;
+}
+
+static CudaCsImage *cs_read_header(int fd, void *hb, const char *fname)
+{
+	CudaCsImage *img;
+	uint32_t len;
+	unsigned int i;
+	ssize_t n;
+
+	n = pread(fd, hb, CS_HDR, 0);
+	if (n != CS_HDR) {
+		if (n < 0)
+			pr_perror("Unable to read %s header", fname);
+		else
+			pr_err("%s: truncated header\n", fname);
+		return NULL;
+	}
+	memcpy(&len, (char *)hb + 4, 4);
+	len = le32toh(len);
+	if (memcmp(hb, CS_MAGIC, 4) || len > CS_HDR - 8) {
+		pr_err("%s is not a custom-storage image\n", fname);
+		return NULL;
+	}
+	img = cuda_cs_image__unpack(NULL, len, (uint8_t *)hb + 8);
+	if (!img) {
+		pr_err("Unable to unpack the %s header\n", fname);
+		return NULL;
+	}
+	if (img->version != CS_IMAGE_VERSION) {
+		pr_err("%s: unsupported version %u\n", fname, img->version);
+		goto err;
+	}
+	for (i = 0; i < img->n_regions; i++) {
+		if (!img->regions[i]->has_size || !img->regions[i]->has_offset ||
+		    img->regions[i]->offset % 4096 || img->regions[i]->offset < CS_HDR) {
+			pr_err("%s: invalid region %u\n", fname, i);
+			goto err;
+		}
+	}
+	return img;
+err:
+	cuda_cs_image__free_unpacked(img, NULL);
+	return NULL;
+}
 
 int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_fd, bool restore)
 {
 	char fname[64];
 	int fd, flags = restore ? O_RDONLY : (O_WRONLY | O_CREAT | O_TRUNC);
 	bool direct = true;
-	struct cs_hdr h;
+	CudaCsRegion regions[CS_MAXDEV];
+	CudaCsImage *img = NULL;
 	void *hb = NULL;
-	off_t off = CS_HDR;
-	unsigned i;
+	unsigned int i;
 	int ret = -1;
 
 	if (!info || info->deviceCount > CS_MAXDEV) {
@@ -508,39 +596,29 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 	memset(hb, 0, CS_HDR);
 
 	if (!restore) {
-		memset(&h, 0, sizeof(h));
-		h.magic = CS_MAGIC;
-		h.ndev = info->deviceCount;
-		for (i = 0; i < info->deviceCount; i++)
-			h.size[i] = info->perDeviceData[i].size;
-		memcpy(hb, &h, sizeof(h));
-		if (pwrite(fd, hb, CS_HDR, 0) != CS_HDR) {
-			pr_perror("Unable to write %s header", fname);
+		if (cs_write_header(fd, hb, info, regions, fname))
 			goto out;
-		}
 	} else {
-		if (pread(fd, hb, CS_HDR, 0) != CS_HDR) {
-			pr_perror("Unable to read %s header", fname);
+		img = cs_read_header(fd, hb, fname);
+		if (!img)
 			goto out;
-		}
-		memcpy(&h, hb, sizeof(h));
-		if (h.magic != CS_MAGIC || h.ndev != info->deviceCount) {
-			pr_err("%s: bad magic or device count (image %u, driver %u)\n", fname, h.ndev, info->deviceCount);
+		if (img->n_regions != info->deviceCount) {
+			pr_err("%s holds %zu devices, the driver maps %u\n", fname, img->n_regions, info->deviceCount);
 			goto out;
 		}
 	}
 
 	for (i = 0; i < info->deviceCount; i++) {
 		CUcheckpointCustomStoragePerDeviceData *d = &info->perDeviceData[i];
+		CudaCsRegion *r = restore ? img->regions[i] : &regions[i];
 
-		if (restore && d->size != h.size[i]) {
+		if (d->size != r->size) {
 			pr_err("%s: device %u size mismatch (image %llu, driver %zu)\n", fname, i,
-			       (unsigned long long)h.size[i], d->size);
+			       (unsigned long long)r->size, d->size);
 			goto out;
 		}
-		if (cs_xfer_region(fd, NULL, off, d, restore, direct))
+		if (cs_xfer_region(fd, NULL, r->offset, d, restore, direct))
 			goto out;
-		off += (d->size + 4095) & ~4095UL;
 	}
 	/* O_DIRECT bypasses the page cache, not the device's write cache. */
 	if (!restore && fdatasync(fd)) {
@@ -549,6 +627,8 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 	}
 	ret = 0;
 out:
+	if (img)
+		cuda_cs_image__free_unpacked(img, NULL);
 	free(hb);
 	close(fd);
 	return ret;

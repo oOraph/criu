@@ -271,6 +271,13 @@ static int cuda_driver_probe(bool device_map_requested)
 			pr_err("cuda_plugin.custom-storage=on but libcuda has no custom-storage checkpoint API\n");
 			return -1;
 		}
+	} else if (opts.stream) {
+		/* gpu-cs-<pid>.img is written next to the images, not through the image streamer. */
+		if (cuda_cs_mode == CUDA_CS_ON) {
+			pr_err("cuda_plugin.custom-storage=on is not supported with --stream\n");
+			return -1;
+		}
+		cuda_cs_mode = CUDA_CS_OFF;
 	}
 
 	driver_version = 0;
@@ -1077,7 +1084,7 @@ static int resume_device(int pid, cuda_task_state_t current_task_state,
 				pr_perror("Unable to kill target pid %d", pid);
 			return -1;
 		}
-	} else {
+	} else if (!opts.stream) {
 		int exists = cuda_cs_image_exists(pid, criu_get_image_dir());
 
 		if (exists < 0)
