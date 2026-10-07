@@ -6,6 +6,8 @@
 
 #include "cuda_checkpoint.h"
 
+#define CUDA_CS_MAXDEV 32 /* GPUs of one task */
+
 /*
  * CUDA 13.4 (driver >= R615) custom-storage checkpoint/restore: the driver maps the target
  * process's GPU memory into the calling process (one contiguous region per GPU) and the caller
@@ -44,9 +46,20 @@ int cuda_cs_check_restore(int pid);
 int cuda_cs_image_exists(int pid, int img_dir_fd);
 /* Remove a gpu-cs-<nspid>.img left by an earlier dump. */
 int cuda_cs_image_remove(int pid, int img_dir_fd);
-/* Retain the primary context of every device (required by the mode); call after cuInit(). */
-int cuda_cs_prepare(void);
-/* Release them. */
+/*
+ * The driver needs CRIU to retain the primary contexts of the GPUs the task
+ * uses, and CRIU must not create any on the others, which can be other
+ * tenants'. At checkpoint, those holding its memory, from NVML: 0 and *n = 0
+ * if it has none, -1 if NVML cannot tell.
+ */
+int cuda_cs_task_gpus(int pid, unsigned char (*gpus)[16], unsigned int *n);
+/* At restore, those its image restores onto, as cuda_cs_transfer() pairs them. */
+int cuda_cs_restore_gpus(int pid, int img_dir_fd, const CUcheckpointGpuPair *pairs, unsigned int npairs,
+			 unsigned char (*gpus)[16], unsigned int *n);
+/* Retain the primary contexts of these GPUs (after cuInit()), until cuda_cs_fini(). */
+int cuda_cs_retain(const unsigned char (*gpus)[16], unsigned int n);
+/* Retain the primary contexts of every GPU CRIU sees, when the task's cannot be told. */
+int cuda_cs_retain_visible(void);
 void cuda_cs_fini(void);
 /*
  * Copy the mapped regions to (restore=false) or from (restore=true) gpu-cs-<nspid>.img in img_dir_fd.

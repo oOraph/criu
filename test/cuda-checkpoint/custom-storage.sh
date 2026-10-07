@@ -60,6 +60,7 @@ criu()
 		CRIU_CUDA_MOCK_INITIAL_STATE="$([ "$ACTION" = restore ] && echo checkpointed || echo running)" \
 		CRIU_CUDA_MOCK_CS_INPUT="$WORK_DIR/gpu-in" \
 		CRIU_CUDA_MOCK_CS_OUTPUT="$WORK_DIR/gpu-out" \
+		CRIU_CUDA_MOCK_NVML_PID="${TARGET_PID:-}" \
 		CUDA_CS_THREADS="${CS_THREADS:-4}" \
 		PATH="$MOCK_DIR:$PATH" \
 		LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
@@ -92,7 +93,11 @@ head -c $((4 * 64 * 1024 * 1024 + 4093)) /dev/urandom >"$WORK_DIR/gpu-in"
 # auto: the API is there, so the GPU memory goes through gpu-cs-<pid>.img and comes back intact.
 # Each worker's two pinned buffers serve every device: 3 workers, 6 allocations.
 export CRIU_CUDA_MOCK_CS_MAX_HOST_ALLOCS=6
+# CRIU only creates contexts on the 2 GPUs of the task, not on the other 2 it sees.
+export CRIU_CUDA_MOCK_CTX_MARKER="$WORK_DIR/contexts"
 dump "$WORK_DIR/auto" "$MOCK_DIR/custom-storage" auto || fail "auto: dump failed"
+[ "$(sort -u "$CRIU_CUDA_MOCK_CTX_MARKER" | tr '\n' ' ')" = "0 1 " ] || fail "auto: contexts on other GPUs at dump"
+rm "$CRIU_CUDA_MOCK_CTX_MARKER"
 CS_IMAGE="$WORK_DIR/auto/gpu-cs-$TARGET_PID.img"
 [ -s "$CS_IMAGE" ] || fail "auto: no $CS_IMAGE"
 [ "$(grep -c "custom-storage checkpoint copy: .*, 3 threads," "$WORK_DIR/auto/dump.log")" -eq 2 ] ||
@@ -101,7 +106,9 @@ criu restore "$WORK_DIR/auto" "$MOCK_DIR/custom-storage" --restore-detached || f
 cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "auto: restored GPU memory differs"
 [ "$(grep -c "custom-storage restore copy: .*, 3 threads," "$WORK_DIR/auto/restore.log")" -eq 2 ] ||
 	fail "auto: restore did not use 3 workers on each of the 2 devices"
-unset CRIU_CUDA_MOCK_CS_MAX_HOST_ALLOCS
+[ "$(sort -u "$CRIU_CUDA_MOCK_CTX_MARKER" | tr '\n' ' ')" = "0 1 " ] || fail "auto: contexts on other GPUs at restore"
+rm "$CRIU_CUDA_MOCK_CTX_MARKER"
+unset CRIU_CUDA_MOCK_CS_MAX_HOST_ALLOCS CRIU_CUDA_MOCK_CTX_MARKER
 stop_target
 
 # One worker per device moves all three chunks, cycling through its two pinned buffers.
@@ -155,11 +162,13 @@ grep -q "unsupported version 2" "$WORK_DIR/version/restore.log" || fail "version
 
 # The driver may list the devices in any order, and a restore may move the task to other GPUs, as when a
 # container gets another GPU: each device's memory goes to the GPU the device map gives for its own.
-rm -f "$WORK_DIR/gpu-out"
-if ! CRIU_CUDA_MOCK_CS_REVERSE=1 CRIU_CUDA_MOCK_UUID_OFFSET=64 criu restore "$WORK_DIR/one" \
-	"$MOCK_DIR/custom-storage" --restore-detached --plugin-option cuda_plugin.device-map=0=1,1=0,2=2,3=3; then
+rm -f "$WORK_DIR/gpu-out" "$WORK_DIR/contexts"
+if ! CRIU_CUDA_MOCK_CTX_MARKER="$WORK_DIR/contexts" CRIU_CUDA_MOCK_CS_REVERSE=1 CRIU_CUDA_MOCK_UUID_OFFSET=64 \
+	criu restore "$WORK_DIR/one" "$MOCK_DIR/custom-storage" --restore-detached \
+	--plugin-option cuda_plugin.device-map=0=1,1=0,2=2,3=3; then
 	fail "remap: restore failed"
 fi
+[ "$(sort -u "$WORK_DIR/contexts" | tr '\n' ' ')" = "0 1 " ] || fail "remap: contexts on GPUs the map does not use"
 TARGET_PID=$ONE_PID
 stop_target
 TARGET_PID=
@@ -168,15 +177,25 @@ cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "remap: GPU memory restored o
 if CRIU_CUDA_MOCK_UUID_OFFSET=64 criu restore "$WORK_DIR/one" "$MOCK_DIR/custom-storage" --restore-detached; then
 	fail "other GPUs: restore succeeded"
 fi
-grep -q "2 GPUs changed since the checkpoint: restoring them needs cuda_plugin.device-map" \
+grep -q "2 GPUs changed since the checkpoint.*: restoring them needs cuda_plugin.device-map" \
 	"$WORK_DIR/one/restore.log" || fail "other GPUs: missing error"
 
 # A task on one GPU restores onto another one without a device map, as a container given another GPU does.
 export CRIU_CUDA_MOCK_CS_DEVICES=1
 dump "$WORK_DIR/single" "$MOCK_DIR/custom-storage" auto || fail "single GPU: dump failed"
+SINGLE_PID=$TARGET_PID
+TARGET_PID=
+# CRIU sees all the GPUs: which one replaces the task's is unknown.
+if CRIU_CUDA_MOCK_UUID_OFFSET=64 criu restore "$WORK_DIR/single" "$MOCK_DIR/custom-storage" --restore-detached; then
+	fail "single GPU: restore among several other GPUs succeeded"
+fi
+grep -q "1 GPUs changed since the checkpoint and CRIU sees 4 other GPUs" "$WORK_DIR/single/restore.log" ||
+	fail "single GPU: missing error"
+# CRIU sees only the GPU given to the container, as under its device cgroup.
 rm -f "$WORK_DIR/gpu-out"
-CRIU_CUDA_MOCK_UUID_OFFSET=64 criu restore "$WORK_DIR/single" "$MOCK_DIR/custom-storage" --restore-detached ||
-	fail "single GPU: restore on another GPU failed"
+CRIU_CUDA_MOCK_VISIBLE_GPUS=1 CRIU_CUDA_MOCK_UUID_OFFSET=64 criu restore "$WORK_DIR/single" \
+	"$MOCK_DIR/custom-storage" --restore-detached || fail "single GPU: restore on another GPU failed"
+TARGET_PID=$SINGLE_PID
 stop_target
 TARGET_PID=
 unset CRIU_CUDA_MOCK_CS_DEVICES
@@ -278,6 +297,18 @@ grep -q "GPU memory of pid $TARGET_PID was lost" "$WORK_DIR/sync/dump.log" || fa
 wait "$TARGET_PID" 2>/dev/null || true
 kill -0 "$TARGET_PID" 2>/dev/null && fail "sync error: the task without its GPU memory was resumed"
 TARGET_PID=
+
+# Without NVML to tell the GPUs of the task, a context is retained on every GPU CRIU sees, in auto as in on.
+export CRIU_CUDA_MOCK_NVML_INIT_ERROR=1 CRIU_CUDA_MOCK_CTX_MARKER="$WORK_DIR/contexts"
+for mode in auto on; do
+	rm -f "$CRIU_CUDA_MOCK_CTX_MARKER"
+	dump "$WORK_DIR/nonvml-$mode" "$MOCK_DIR/custom-storage" $mode || fail "no NVML: $mode dump failed"
+	[ -s "$WORK_DIR/nonvml-$mode/gpu-cs-$TARGET_PID.img" ] || fail "no NVML: $mode wrote no custom-storage image"
+	grep -q "NVML does not list pid $TARGET_PID" "$WORK_DIR/nonvml-$mode/dump.log" || fail "no NVML: $mode did not say so"
+	[ "$(sort -u "$CRIU_CUDA_MOCK_CTX_MARKER" | tr '\n' ' ')" = "0 1 2 3 " ] || fail "no NVML: $mode did not retain every GPU"
+done
+TARGET_PID=
+unset CRIU_CUDA_MOCK_NVML_INIT_ERROR CRIU_CUDA_MOCK_CTX_MARKER
 
 # on: a driver without the API must fail the dump.
 if dump "$WORK_DIR/on" "$MOCK_DIR" on; then

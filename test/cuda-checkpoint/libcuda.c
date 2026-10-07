@@ -228,7 +228,8 @@ mock_cuda_result_t cuDeviceGetCount(int *count)
 	    !environment_matches("CUDA_DEVICE_ORDER", "CRIU_CUDA_MOCK_EXPECT_DEVICE_ORDER"))
 		return MOCK_CUDA_ERROR_INVALID_VALUE;
 
-	*count = MOCK_GPU_COUNT;
+	/* CRIU_CUDA_MOCK_VISIBLE_GPUS: CRIU sees fewer GPUs, as in a container's device cgroup */
+	*count = getenv("CRIU_CUDA_MOCK_VISIBLE_GPUS") ? atoi(getenv("CRIU_CUDA_MOCK_VISIBLE_GPUS")) : MOCK_GPU_COUNT;
 	return MOCK_CUDA_SUCCESS;
 }
 
@@ -432,8 +433,9 @@ struct mock_cs_info {
 };
 
 static struct mock_cs_device cs_devices[MOCK_GPU_COUNT];
-static char cs_ctx[MOCK_GPU_COUNT]; /* the primary context of each GPU */
-static int cs_gpu[MOCK_GPU_COUNT];  /* the GPU of each device */
+static char cs_ctx[MOCK_GPU_COUNT];	/* the primary context of each GPU */
+static int cs_retained[MOCK_GPU_COUNT]; /* references to it */
+static int cs_gpu[MOCK_GPU_COUNT];	/* the GPU of each device */
 static struct mock_cs_info cs_info = { &cs_info, cs_devices, 0 };
 static char *cs_buf;
 static size_t cs_size;
@@ -490,7 +492,8 @@ static int mock_cs_begin(bool restore, void *args, size_t out_offset)
 
 		cs_devices[k] = (struct mock_cs_device){ (uintptr_t)(buf + start), end - start, &cs_devices[k] };
 		cs_gpu[k] = restore ? mock_cs_restore_gpu(args, i) : i;
-		if (cs_gpu[k] < 0)
+		/* like CUDA_ERROR_INVALID_CONTEXT: the caller must retain the primary context of each GPU */
+		if (cs_gpu[k] < 0 || !cs_retained[cs_gpu[k]])
 			return -1;
 	}
 	cs_info.device_count = n;
@@ -524,7 +527,6 @@ mock_cuda_result_t cuCheckpointOperationComplete(void *handle)
 MOCK_NOOP(cuStreamDestroy, void *stream)
 MOCK_NOOP(cuEventRecord, void *event, void *stream)
 MOCK_NOOP(cuEventDestroy, void *event)
-MOCK_NOOP(cuDevicePrimaryCtxRelease, int device)
 
 /* Errors of asynchronous copies show up when synchronising. */
 mock_cuda_result_t cuEventSynchronize(void *event)
@@ -537,11 +539,34 @@ mock_cuda_result_t cuStreamSynchronize(void *stream)
 	return getenv("CRIU_CUDA_MOCK_CS_SYNC_ERROR") ? MOCK_CUDA_ERROR_INVALID_VALUE : MOCK_CUDA_SUCCESS;
 }
 
+/* CRIU_CUDA_MOCK_CTX_MARKER records the ordinal of each GPU whose primary context is retained. */
 mock_cuda_result_t cuDevicePrimaryCtxRetain(void **ctx, int device)
 {
-	if (device < MOCK_DEVICE_HANDLE_BASE || device >= MOCK_DEVICE_HANDLE_BASE + MOCK_GPU_COUNT)
+	const char *marker = getenv("CRIU_CUDA_MOCK_CTX_MARKER");
+	int ordinal = device - MOCK_DEVICE_HANDLE_BASE;
+
+	if (ordinal < 0 || ordinal >= MOCK_GPU_COUNT)
 		return MOCK_CUDA_ERROR_INVALID_VALUE;
-	*ctx = &cs_ctx[device - MOCK_DEVICE_HANDLE_BASE];
+	if (marker) {
+		FILE *file = fopen(marker, "a");
+
+		if (!file)
+			return MOCK_CUDA_ERROR_INVALID_VALUE;
+		fprintf(file, "%d\n", ordinal);
+		fclose(file);
+	}
+	cs_retained[ordinal]++;
+	*ctx = &cs_ctx[ordinal];
+	return MOCK_CUDA_SUCCESS;
+}
+
+mock_cuda_result_t cuDevicePrimaryCtxRelease(int device)
+{
+	int ordinal = device - MOCK_DEVICE_HANDLE_BASE;
+
+	if (ordinal < 0 || ordinal >= MOCK_GPU_COUNT || !cs_retained[ordinal])
+		return MOCK_CUDA_ERROR_INVALID_VALUE;
+	cs_retained[ordinal]--;
 	return MOCK_CUDA_SUCCESS;
 }
 

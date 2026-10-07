@@ -43,11 +43,10 @@
 #define CS_MAXTHR 32
 #define CS_HDR	  4096
 #define CS_MAGIC  "CUCS"
-#define CS_MAXDEV 32
+#define CS_MAXDEV CUDA_CS_MAXDEV
 
 enum cuda_cs_mode cuda_cs_mode = CUDA_CS_AUTO;
 static bool cs_available;
-static bool cs_prepared;
 
 typedef int CUdevice;
 typedef void *CUcontext;
@@ -176,48 +175,6 @@ int cuda_cs_check_restore(int pid)
 	return 0;
 }
 
-/* The devices whose primary context CRIU retains, released by cuda_cs_fini(). */
-static CUdevice *cs_retained;
-static int cs_nr_retained;
-
-int cuda_cs_prepare(void)
-{
-	int n, i;
-	CUresult r;
-
-	if (cs_prepared)
-		return 0;
-	r = cs.device_get_count(&n);
-	if (r != CUDA_SUCCESS) {
-		pr_err("cuDeviceGetCount: %s\n", cs_err(r));
-		return -1;
-	}
-	cs_retained = calloc(n ?: 1, sizeof(*cs_retained));
-	if (!cs_retained)
-		return -1;
-	for (i = 0; i < n; i++) {
-		CUdevice d;
-		CUcontext c;
-		if ((r = cs.device_get(&d, i)) != CUDA_SUCCESS || (r = cs.primary_ctx_retain(&c, d)) != CUDA_SUCCESS) {
-			pr_err("Unable to retain primary context of device %d: %s\n", i, cs_err(r));
-			return -1;
-		}
-		cs_retained[cs_nr_retained++] = d;
-	}
-	cs_prepared = true;
-	return 0;
-}
-
-void cuda_cs_fini(void)
-{
-	/* A primary context holds GPU memory that the restored tasks may need. */
-	while (cs_nr_retained)
-		cs.primary_ctx_release(cs_retained[--cs_nr_retained]);
-	free(cs_retained);
-	cs_retained = NULL;
-	cs_prepared = false;
-}
-
 int cuda_cs_complete(CUcheckpointOperationHandle handle)
 {
 	CUresult r = cs.operation_complete(handle);
@@ -293,6 +250,35 @@ int cuda_cs_image_remove(int pid, int img_dir_fd)
 		return -1;
 	}
 	return 0;
+}
+
+/* "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" as NVML prints it */
+static int cs_parse_uuid(const char *text, unsigned char uuid[16])
+{
+	int digits = 0, v;
+
+	if (strncmp(text, "GPU-", 4))
+		return -1;
+	for (text += 4; *text; text++) {
+		if (*text == '-')
+			continue;
+		if (*text >= '0' && *text <= '9')
+			v = *text - '0';
+		else if (*text >= 'a' && *text <= 'f')
+			v = *text - 'a' + 10;
+		else if (*text >= 'A' && *text <= 'F')
+			v = *text - 'A' + 10;
+		else
+			return -1;
+		if (digits == 32)
+			return -1;
+		if (digits & 1)
+			uuid[digits / 2] |= v;
+		else
+			uuid[digits / 2] = v << 4;
+		digits++;
+	}
+	return digits == 32 ? 0 : -1;
 }
 
 static double cs_now_ms(void)
@@ -920,4 +906,268 @@ void cuda_cs_rescue_free(struct cuda_cs_rescue *r)
 		return;
 	munmap(r->mem, r->len ?: 1);
 	free(r);
+}
+
+#define CS_MAXGPU 64
+
+/* The devices whose primary context CRIU retains, released by cuda_cs_fini(). */
+static CUdevice cs_retained[CS_MAXGPU];
+static int cs_nr_retained;
+
+/* The GPUs CRIU sees, with their UUIDs. */
+static int cs_visible(CUdevice *devs, unsigned char (*uuids)[16], int *n)
+{
+	CUresult r;
+	int i;
+
+	if ((r = cs.device_get_count(n)) != CUDA_SUCCESS) {
+		pr_err("cuDeviceGetCount: %s\n", cs_err(r));
+		return -1;
+	}
+	if (*n > CS_MAXGPU) {
+		pr_err("%d GPUs, at most %d are supported\n", *n, CS_MAXGPU);
+		return -1;
+	}
+	for (i = 0; i < *n; i++) {
+		if ((r = cs.device_get(&devs[i], i)) != CUDA_SUCCESS ||
+		    (r = cs.device_get_uuid(uuids[i], devs[i])) != CUDA_SUCCESS) {
+			pr_err("Unable to get GPU %d: %s\n", i, cs_err(r));
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int cs_find_uuid(const unsigned char (*uuids)[16], int n, const unsigned char uuid[16])
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (!memcmp(uuids[i], uuid, 16))
+			return i;
+	return -1;
+}
+
+int cuda_cs_retain(const unsigned char (*gpus)[16], unsigned int n)
+{
+	unsigned char uuids[CS_MAXGPU][16];
+	CUdevice devs[CS_MAXGPU];
+	unsigned int i;
+	char buf[33];
+	int nvis, j, k;
+	CUcontext c;
+	CUresult r;
+
+	if (cs_visible(devs, uuids, &nvis))
+		return -1;
+	for (i = 0; i < n; i++) {
+		j = cs_find_uuid(uuids, nvis, gpus[i]);
+		if (j < 0) {
+			pr_err("GPU %s is not visible to CRIU\n", cs_uuid_str(gpus[i], buf));
+			return -1;
+		}
+		for (k = 0; k < cs_nr_retained; k++)
+			if (cs_retained[k] == devs[j])
+				break;
+		if (k < cs_nr_retained)
+			continue;
+		if ((r = cs.primary_ctx_retain(&c, devs[j])) != CUDA_SUCCESS) {
+			pr_err("Unable to retain the primary context of GPU %s: %s\n", cs_uuid_str(gpus[i], buf),
+			       cs_err(r));
+			return -1;
+		}
+		cs_retained[cs_nr_retained++] = devs[j];
+		pr_info("Retained the primary context of GPU %s\n", cs_uuid_str(gpus[i], buf));
+	}
+	return 0;
+}
+
+int cuda_cs_retain_visible(void)
+{
+	unsigned char uuids[CS_MAXGPU][16];
+	CUdevice devs[CS_MAXGPU];
+	int nvis;
+
+	if (cs_visible(devs, uuids, &nvis))
+		return -1;
+	return cuda_cs_retain(uuids, nvis);
+}
+
+void cuda_cs_fini(void)
+{
+	/* A primary context holds GPU memory that the restored tasks may need. */
+	while (cs_nr_retained)
+		cs.primary_ctx_release(cs_retained[--cs_nr_retained]);
+}
+
+/*
+ * NVML, loaded only to find the GPUs of a task: it lists the processes with
+ * memory on each GPU without creating a context on any.
+ */
+typedef void *nvmlDevice_t;
+typedef struct {
+	unsigned int pid;
+	unsigned long long usedGpuMemory;
+	unsigned int gpuInstanceId;
+	unsigned int computeInstanceId;
+} nvmlProcessInfo_t;
+
+#define NVML_SUCCESS		     0
+#define NVML_ERROR_INSUFFICIENT_SIZE 7
+
+int cuda_cs_task_gpus(int pid, unsigned char (*gpus)[16], unsigned int *n)
+{
+	int (*init)(void), (*shutdown)(void), (*get_count)(unsigned int *);
+	int (*get_handle)(unsigned int, nvmlDevice_t *), (*get_uuid)(nvmlDevice_t, char *, unsigned int);
+	int (*get_procs)(nvmlDevice_t, unsigned int *, nvmlProcessInfo_t *);
+	nvmlProcessInfo_t *procs = NULL;
+	unsigned int count, i, j, nprocs;
+	char text[96];
+	void *h;
+	int r, ret = -1;
+
+	*n = 0;
+	h = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+	if (!h) {
+		pr_warn("Unable to load NVML to find the GPUs of pid %d: %s\n", pid, dlerror());
+		return -1;
+	}
+	init = dlsym(h, "nvmlInit_v2");
+	shutdown = dlsym(h, "nvmlShutdown");
+	get_count = dlsym(h, "nvmlDeviceGetCount_v2");
+	get_handle = dlsym(h, "nvmlDeviceGetHandleByIndex_v2");
+	get_uuid = dlsym(h, "nvmlDeviceGetUUID");
+	get_procs = dlsym(h, "nvmlDeviceGetComputeRunningProcesses_v3");
+	if (!init || !shutdown || !get_count || !get_handle || !get_uuid || !get_procs) {
+		pr_warn("NVML lacks the functions to find the GPUs of pid %d\n", pid);
+		goto close;
+	}
+	if ((r = init()) != NVML_SUCCESS) {
+		pr_warn("nvmlInit failed: %d\n", r);
+		goto close;
+	}
+	if ((r = get_count(&count)) != NVML_SUCCESS) {
+		pr_warn("nvmlDeviceGetCount failed: %d\n", r);
+		goto shutdown;
+	}
+	/*
+	 * MIG is not handled: the processes of a MIG instance are listed on its
+	 * own device handle, and the context to retain is the instance's.
+	 */
+	for (i = 0; i < count; i++) {
+		nvmlDevice_t dev;
+
+		if ((r = get_handle(i, &dev)) != NVML_SUCCESS) {
+			pr_warn("nvmlDeviceGetHandleByIndex(%u) failed: %d\n", i, r);
+			goto shutdown;
+		}
+		nprocs = 0;
+		r = get_procs(dev, &nprocs, NULL);
+		while (r == NVML_ERROR_INSUFFICIENT_SIZE) {
+			free(procs);
+			nprocs += 8; /* processes may start in between */
+			procs = calloc(nprocs, sizeof(*procs));
+			if (!procs)
+				goto shutdown;
+			r = get_procs(dev, &nprocs, procs);
+		}
+		if (r != NVML_SUCCESS) {
+			pr_warn("nvmlDeviceGetComputeRunningProcesses(%u) failed: %d\n", i, r);
+			goto shutdown;
+		}
+		for (j = 0; j < nprocs && procs; j++)
+			if (procs[j].pid == (unsigned int)pid)
+				break;
+		if (!procs || j == nprocs)
+			continue;
+		if (*n == CS_MAXDEV) {
+			pr_warn("pid %d uses more than %d GPUs\n", pid, CS_MAXDEV);
+			goto shutdown;
+		}
+		if ((r = get_uuid(dev, text, sizeof(text))) != NVML_SUCCESS || cs_parse_uuid(text, gpus[*n])) {
+			pr_warn("Unable to get the UUID of GPU %u: %d\n", i, r);
+			goto shutdown;
+		}
+		(*n)++;
+	}
+	ret = 0;
+shutdown:
+	shutdown();
+close:
+	free(procs);
+	dlclose(h);
+	return ret;
+}
+
+int cuda_cs_restore_gpus(int pid, int img_dir_fd, const CUcheckpointGpuPair *pairs, unsigned int npairs,
+			 unsigned char (*gpus)[16], unsigned int *n)
+{
+	unsigned char uuids[CS_MAXGPU][16];
+	CUdevice devs[CS_MAXGPU];
+	CudaCsImage *img = NULL;
+	int nvis, left = -1, extra = -1, nleft = 0, nextra = 0;
+	char fname[64], a[33], b[33];
+	unsigned int i, k;
+	void *hb = NULL;
+	int fd, j, ret = -1;
+
+	*n = 0;
+	if (cs_visible(devs, uuids, &nvis) || cs_image_name(pid, fname, sizeof(fname)))
+		return -1;
+	fd = openat(img_dir_fd, fname, O_RDONLY);
+	if (fd < 0) {
+		pr_perror("Unable to open %s", fname);
+		return -1;
+	}
+	if (posix_memalign(&hb, 4096, CS_HDR))
+		goto out;
+	img = cs_read_header(fd, hb, fname);
+	if (!img)
+		goto out;
+
+	/* The same choice as cs_assign() makes once the driver mapped the memory. */
+	for (i = 0; i < img->n_regions; i++) {
+		const unsigned char *old = img->regions[i]->uuid.data;
+		const unsigned char *dst = old;
+
+		for (k = 0; k < npairs; k++) {
+			if (!memcmp(pairs[k].oldUuid, old, 16)) {
+				dst = pairs[k].newUuid;
+				break;
+			}
+		}
+		if (!npairs && cs_find_uuid(uuids, nvis, old) < 0) {
+			left = i;
+			nleft++;
+			continue;
+		}
+		memcpy(gpus[(*n)++], dst, 16);
+	}
+	if (nleft) {
+		/* Without a map, a single GPU that changed: the single GPU CRIU sees and the task did not use. */
+		for (j = 0; j < nvis; j++) {
+			for (i = 0; i < img->n_regions; i++)
+				if (!memcmp(img->regions[i]->uuid.data, uuids[j], 16))
+					break;
+			if (i == img->n_regions) {
+				extra = j;
+				nextra++;
+			}
+		}
+		if (nleft > 1 || nextra != 1) {
+			pr_err("%d GPUs changed since the checkpoint and CRIU sees %d other GPUs: restoring them needs cuda_plugin.device-map\n",
+			       nleft, nextra);
+			goto out;
+		}
+		pr_info("GPU %s, not visible, is restored onto GPU %s\n",
+			cs_uuid_str(img->regions[left]->uuid.data, a), cs_uuid_str(uuids[extra], b));
+		memcpy(gpus[(*n)++], uuids[extra], 16);
+	}
+	ret = 0;
+out:
+	if (img)
+		cuda_cs_image__free_unpacked(img, NULL);
+	free(hb);
+	close(fd);
+	return ret;
 }

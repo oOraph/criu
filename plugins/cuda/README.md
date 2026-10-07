@@ -156,9 +156,15 @@ checkpointed process itself needs no privilege. The number of
 transfer threads can be set with the `CUDA_CS_THREADS` environment variable
 (default 4; host-to-device copies into the mapping degrade with many
 concurrent streams). On NVSwitch systems CUDA also needs NVIDIA Fabric
-Manager at exactly the driver's version. CRIU retains the primary context of
-every visible GPU while it copies, which takes some GPU memory on each until
-CRIU releases them when it finishes.
+Manager at exactly the driver's version. As `cuda.h` documents, the caller must
+have retained the primary context of every GPU the task uses, or the driver
+returns `CUDA_ERROR_INVALID_CONTEXT`; each context takes some memory on its GPU
+until CRIU finishes. CRIU creates none on the other GPUs, which can be other
+tenants': at checkpoint, it finds the GPUs holding the task's memory with NVML
+(`libnvidia-ml.so.1`), which lists processes by their pid in the init pid
+namespace: CRIU must run in it to match the task. When NVML does not list it,
+CRIU retains a context on every GPU it sees. At restore, they are the GPUs the
+image restores onto, see below. MIG is not handled.
 
 `gpu-cs-<pid>.img` starts with the `CUCS` magic, the length of a
 `cuda_cs_image` header (`cuda.proto`) that gives the size and offset of the
@@ -171,8 +177,11 @@ The image records the UUID of the GPU each device's memory was on, and
 restore puts it on the GPU that `cuda_plugin.device-map` gives for that one,
 or on the same GPU without a map, whatever order the driver lists them in.
 Without a map, a task that used one GPU can also restore onto another one, as
-the driver allows: the only GPU left takes the only memory left. With more
-GPUs changed, restore needs the map.
+the driver allows, when CRIU no longer sees the GPU it used: the only GPU left
+takes the only memory left. When CRIU still sees that GPU but the task restores
+onto another one, as a container given another GPU through its device cgroup
+while CRIU runs on the host, restore needs the map to retain the right context.
+With more GPUs changed, restore needs the map.
 
 ## GPU device mapping
 
