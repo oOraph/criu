@@ -27,6 +27,10 @@ message cuda_cs_region {
 	// Raw 16-byte UUID of the GPU it was on: restore puts it on the GPU
 	// that the device map gives for this one, whatever the driver's order.
 	optional bytes uuid = 3;
+	// The chunks (64 MiB) that were all zero and not written, as a bitmap:
+	// little-endian 64-bit words, bit k of word k / 64 set for chunk k. The
+	// file has a hole there, so a restore without this field reads zeros.
+	optional bytes zero_chunks = 4;
 }
 
 message cuda_cs_image {

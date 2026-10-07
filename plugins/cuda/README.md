@@ -180,6 +180,12 @@ error), the GPU memory is lost: the failed dump kills the task instead of
 resuming it without its GPU memory. No copy is kept in CRIU's memory, which
 would need as much host memory as the GPU memory.
 
+A 64 MiB chunk that reads back as all zeros is not written: the image keeps
+a hole there and the header flags it, and restore clears it on the device
+instead of reading it. Inference servers reserve most of the GPU for a KV
+cache that is still zero at checkpoint time, so this skips a large share of
+the I/O. `CUDA_CS_ZERO_SKIP=0` in CRIU's environment writes every chunk.
+
 `gpu-cs-<pid>.img` starts with the `CUCS` magic, the length of a
 `cuda_cs_image` header (`cuda.proto`) that gives the size, the offset and the
 GPU UUID of the memory of each device, and then that memory, raw. `crit` does

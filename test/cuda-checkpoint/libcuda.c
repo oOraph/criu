@@ -638,6 +638,13 @@ mock_cuda_result_t cuMemcpyHtoDAsync(unsigned long long dst, const void *src, si
 	return current_ctx ? MOCK_CUDA_SUCCESS : MOCK_CUDA_ERROR_INVALID_VALUE;
 }
 
+mock_cuda_result_t cuMemsetD8Async(unsigned long long dst, unsigned char value, size_t size, void *stream)
+{
+	(void)stream;
+	memset((void *)(uintptr_t)dst, value, size);
+	return current_ctx ? MOCK_CUDA_SUCCESS : MOCK_CUDA_ERROR_INVALID_VALUE;
+}
+
 /* Only the 3-argument cuStreamGetCtx_v2 exists; the plugin must get it through cuGetProcAddress. */
 static mock_cuda_result_t stream_get_ctx_v2(void *stream, void **ctx, void **green_ctx)
 {

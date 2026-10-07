@@ -15,6 +15,13 @@
  * third returns a green context, NULL for the primary contexts used here).
  * The caller must be allowed to ptrace the target, as CRIU already is.
  * The mapped pointer carries no CU_POINTER_ATTRIBUTE_CONTEXT; use the stream's.
+ *
+ * Zero chunks: on checkpoint, a chunk that reads back as all zeros is not
+ * written (the image keeps a hole) and is flagged in the bitmap of its region
+ * in the header; on restore it is cleared on the device (cuMemsetD8Async)
+ * instead of being read and copied. Inference servers reserve most of the GPU
+ * for a KV cache that is still zero at checkpoint time, so this skips a large
+ * share of the I/O. CUDA_CS_ZERO_SKIP=0 disables it on checkpoint.
  */
 #include "criu-log.h"
 #include "cuda_custom_storage.h"
@@ -73,6 +80,7 @@ static struct {
 	CUresult (*mem_free_host)(void *);
 	CUresult (*memcpy_dtoh_async)(void *, CUdeviceptr, size_t, CUstream);
 	CUresult (*memcpy_htod_async)(CUdeviceptr, const void *, size_t, CUstream);
+	CUresult (*memset_d8_async)(CUdeviceptr, unsigned char, size_t, CUstream);
 	CUresult (*event_create)(CUevent *, unsigned);
 	CUresult (*event_destroy)(CUevent);
 	CUresult (*event_record)(CUevent, CUstream);
@@ -150,6 +158,7 @@ int cuda_cs_init(void *h)
 	R(mem_free_host, "cuMemFreeHost");
 	R(memcpy_dtoh_async, "cuMemcpyDtoHAsync");
 	R(memcpy_htod_async, "cuMemcpyHtoDAsync");
+	R(memset_d8_async, "cuMemsetD8Async");
 	R(event_create, "cuEventCreate");
 	R(event_destroy, "cuEventDestroy");
 	R(event_record, "cuEventRecord");
@@ -306,6 +315,29 @@ static int cs_threads(void)
 	return n;
 }
 
+static bool cs_zero_skip_enabled(void)
+{
+	const char *e = getenv("CUDA_CS_ZERO_SKIP");
+
+	return !(e && !strcmp(e, "0"));
+}
+
+static bool cs_is_zero(const unsigned char *c, size_t len)
+{
+	static const unsigned char z[64];
+
+	/* The first 64 bytes are zero and each byte equals the one 64 bytes before it: a SIMD memcmp. */
+	if (len <= sizeof(z))
+		return !memcmp(c, z, len);
+	return !memcmp(c, z, sizeof(z)) && !memcmp(c, c + sizeof(z), len - sizeof(z));
+}
+
+/* One bit per chunk of a region, in 64-bit words. */
+static size_t cs_zwords(size_t size)
+{
+	return ((size + CS_CHUNK - 1) / CS_CHUNK + 63) / 64;
+}
+
 /*
  * One region's transfer, shared by all its workers. Only next (the next chunk
  * to take) and err change while they run, hence the atomics; the rest is set
@@ -321,6 +353,8 @@ struct cs_xfer {
 	size_t nchunks;
 	atomic_size_t next;
 	atomic_int err;
+	_Atomic uint64_t *zmap; /* the zero chunks of the region, NULL: no skipping */
+	atomic_size_t zchunks;
 };
 
 struct cs_warg {
@@ -389,6 +423,14 @@ static int cs_store(struct cs_warg *worker, void *buf, CUevent event, size_t off
 
 	/* Wait for the DtoH copy into buf to complete. */
 	CS_CALL(cs.event_synchronize(event), "cuEventSynchronize");
+	if (xfer->zmap && cs_is_zero(buf, len)) {
+		/* Leave a hole; the file gets its full length once every region is written. */
+		size_t chunk = off / CS_CHUNK;
+
+		atomic_fetch_or(&xfer->zmap[chunk / 64], 1ULL << (chunk % 64));
+		atomic_fetch_add(&xfer->zchunks, 1);
+		return 0;
+	}
 
 	/*
 	 * The O_DIRECT tail of the last chunk would hold the previous chunk's
@@ -450,6 +492,16 @@ static void *cs_worker(void *p)
 			pending = true;
 			prev_off = off;
 			prev_len = len;
+		} else if (xfer->zmap && (atomic_load(&xfer->zmap[chunk / 64]) & (1ULL << (chunk % 64)))) {
+			/* Restore of a zero chunk: the fallback below overwrites this buffer too. */
+			CS_CALL(cs.event_synchronize(events[handled_idx]), "cuEventSynchronize");
+			atomic_fetch_add(&xfer->zchunks, 1);
+			if (cs.memset_d8_async(xfer->dptr + off, 0, len, stream) != CUDA_SUCCESS) {
+				/* Not every mapping may accept a device memset: copy zeros instead. */
+				memset(buf[handled_idx], 0, len);
+				CS_CALL(cs.memcpy_htod_async(xfer->dptr + off, buf[handled_idx], len, stream), "cuMemcpyHtoDAsync");
+			}
+			CS_CALL(cs.event_record(events[handled_idx], stream), "cuEventRecord");
 		} else {
 			/* Restore: wait for this buffer's previous HtoD copy before overwriting it (no-op the first time). */
 			CS_CALL(cs.event_synchronize(events[handled_idx]), "cuEventSynchronize");
@@ -598,7 +650,7 @@ static int cs_assign(const unsigned char (*cur)[16], const unsigned char (*old)[
 }
 
 static int cs_xfer_region(int fd, off_t file_off, CUcheckpointCustomStoragePerDeviceData *mapping, bool restore, bool direct,
-			  struct cs_pool *pool)
+			  struct cs_pool *pool, _Atomic uint64_t *zmap)
 {
 	struct cs_xfer xfer;
 	struct cs_warg wa[CS_MAXTHR];
@@ -629,6 +681,8 @@ static int cs_xfer_region(int fd, off_t file_off, CUcheckpointCustomStoragePerDe
 	xfer.nchunks = (mapping->size + CS_CHUNK - 1) / CS_CHUNK;
 	atomic_init(&xfer.next, 0);
 	atomic_init(&xfer.err, 0);
+	xfer.zmap = zmap;
+	atomic_init(&xfer.zchunks, 0);
 
 	nthreads = cs_threads();
 	if ((size_t)nthreads > xfer.nchunks)
@@ -651,15 +705,20 @@ static int cs_xfer_region(int fd, off_t file_off, CUcheckpointCustomStoragePerDe
 	for (i = 0; i < nthreads; i++)
 		pthread_join(th[i], NULL);
 
-	pr_info("[timing] custom-storage %s: %.2f GB, %d threads, %.0f ms (%.1f GB/s, %s)\n",
+	pr_info("[timing] custom-storage %s: %.2f GB, %d threads, %.0f ms (%.1f GB/s, %s), zero chunks %zu/%zu%s\n",
 		restore ? "restore copy" : "checkpoint copy", mapping->size / 1e9, nthreads, cs_now_ms() - t0,
-		mapping->size / (cs_now_ms() - t0) / 1e6, direct ? "O_DIRECT" : "buffered");
+		mapping->size / (cs_now_ms() - t0) / 1e6, direct ? "O_DIRECT" : "buffered", atomic_load(&xfer.zchunks), xfer.nchunks,
+		zmap ? "" : " (skip off)");
 	return atomic_load(&xfer.err) ? -1 : 0;
 }
 
-/* Lay the regions out after the header and write it. */
+/*
+ * Lay the regions out after the header and write it. zbits[i], of zlen[i]
+ * bytes, is the zero-chunk bitmap of region i, or NULL. -ENOSPC if the header
+ * does not fit.
+ */
 static int cs_write_header(int fd, void *hdr_buf, CUcheckpointCustomStorageInfo *info, CudaCsRegion *regions,
-			   unsigned char (*uuids)[16], const char *fname)
+			   unsigned char (*uuids)[16], unsigned char **zbits, size_t *zlen, const char *fname)
 {
 	CudaCsRegion *rp[CUDA_CS_MAXDEV];
 	CudaCsImage img = CUDA_CS_IMAGE__INIT;
@@ -676,6 +735,11 @@ static int cs_write_header(int fd, void *hdr_buf, CUcheckpointCustomStorageInfo 
 		regions[i].has_uuid = true;
 		regions[i].uuid.len = 16;
 		regions[i].uuid.data = uuids[i];
+		if (zbits && zbits[i]) {
+			regions[i].has_zero_chunks = true;
+			regions[i].zero_chunks.len = zlen[i];
+			regions[i].zero_chunks.data = zbits[i];
+		}
 		off += cs_align(regions[i].size);
 		rp[i] = &regions[i];
 	}
@@ -686,9 +750,10 @@ static int cs_write_header(int fd, void *hdr_buf, CUcheckpointCustomStorageInfo 
 	len = cuda_cs_image__get_packed_size(&img);
 	if (len > CS_HDR - 8) {
 		pr_err("%s: header of %zu bytes does not fit\n", fname, len);
-		return -1;
+		return -ENOSPC;
 	}
 	len32 = htole32(len);
+	memset(hdr_buf, 0, CS_HDR);
 	memcpy(hdr_buf, CS_MAGIC, 4);
 	memcpy((char *)hdr_buf + 4, &len32, 4);
 	cuda_cs_image__pack(&img, (uint8_t *)hdr_buf + 8);
@@ -759,8 +824,15 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 	int src[CUDA_CS_MAXDEV];
 	struct cs_pool pool = {};
 	CudaCsImage *img = NULL;
+	/* The zero chunks of each region: the bitmap the workers fill or follow, and its image bytes. */
+	_Atomic uint64_t *zmap[CUDA_CS_MAXDEV] = {};
+	unsigned char *zbits[CUDA_CS_MAXDEV] = {};
+	size_t zlen[CUDA_CS_MAXDEV] = {};
+	bool zskip = !restore && cs_zero_skip_enabled();
 	void *hdr_buf = NULL;
+	off_t end = CS_HDR;
 	unsigned int i;
+	size_t w;
 	int ret = -1;
 
 	if (!info) {
@@ -794,7 +866,27 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 			goto out;
 
 	if (!restore) {
-		if (cs_write_header(fd, hdr_buf, info, regions, uuids, fname))
+		if (zskip) {
+			/* Written zeroed first, so that the layout is final; rewritten once the chunks are known. */
+			for (i = 0; i < info->deviceCount; i++) {
+				zlen[i] = cs_zwords(info->perDeviceData[i].size) * sizeof(uint64_t);
+				zbits[i] = calloc(1, zlen[i] ?: 1);
+				zmap[i] = calloc(zlen[i] / sizeof(uint64_t) ?: 1, sizeof(uint64_t));
+				if (!zbits[i] || !zmap[i])
+					goto out;
+			}
+			ret = cs_write_header(fd, hdr_buf, info, regions, uuids, zbits, zlen, fname);
+			if (ret == -ENOSPC) {
+				pr_warn("%s: no room for the zero-chunk bitmaps, writing every chunk\n", fname);
+				zskip = false;
+				for (i = 0; i < info->deviceCount; i++) {
+					free(zmap[i]);
+					zmap[i] = NULL;
+				}
+			}
+			ret = -1;
+		}
+		if (!zskip && cs_write_header(fd, hdr_buf, info, regions, uuids, NULL, NULL, fname))
 			goto out;
 	} else {
 		img = cs_read_header(fd, hdr_buf, fname);
@@ -819,16 +911,57 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 			       (unsigned long long)region->size, mapping->size);
 			goto out;
 		}
-		if (cs_xfer_region(fd, region->offset, mapping, restore, direct, &pool))
+		if (restore && region->has_zero_chunks && region->zero_chunks.len) {
+			size_t nwords = cs_zwords(mapping->size);
+
+			if (region->zero_chunks.len != nwords * sizeof(uint64_t)) {
+				pr_err("%s: device %u has a zero-chunk bitmap of %zu bytes, %zu expected\n", fname, i,
+				       region->zero_chunks.len, nwords * sizeof(uint64_t));
+				goto out;
+			}
+			zmap[i] = calloc(nwords ?: 1, sizeof(uint64_t));
+			if (!zmap[i])
+				goto out;
+			for (w = 0; w < nwords; w++) {
+				uint64_t v;
+
+				memcpy(&v, region->zero_chunks.data + w * sizeof(v), sizeof(v));
+				atomic_init(&zmap[i][w], le64toh(v));
+			}
+		}
+		if (cs_xfer_region(fd, region->offset, mapping, restore, direct, &pool, zmap[i]))
 			goto out;
+		end = region->offset + cs_align(region->size);
 	}
-	/* O_DIRECT bypasses the page cache, not the device's write cache. */
-	if (!restore && fdatasync(fd)) {
-		pr_perror("Unable to sync %s", fname);
-		goto out;
+	if (!restore) {
+		if (zskip) {
+			for (i = 0; i < info->deviceCount; i++) {
+				for (w = 0; w < zlen[i] / sizeof(uint64_t); w++) {
+					uint64_t v = htole64(atomic_load(&zmap[i][w]));
+
+					memcpy(zbits[i] + w * sizeof(v), &v, sizeof(v));
+				}
+			}
+			if (cs_write_header(fd, hdr_buf, info, regions, uuids, zbits, zlen, fname))
+				goto out;
+		}
+		/* Skipped chunks at the end of the last region: the file still spans every region. */
+		if (ftruncate(fd, end)) {
+			pr_perror("Unable to set the length of %s", fname);
+			goto out;
+		}
+		/* O_DIRECT bypasses the page cache, not the device's write cache. */
+		if (fdatasync(fd)) {
+			pr_perror("Unable to sync %s", fname);
+			goto out;
+		}
 	}
 	ret = 0;
 out:
+	for (i = 0; i < CUDA_CS_MAXDEV; i++) {
+		free(zmap[i]);
+		free(zbits[i]);
+	}
 	cs_pool_free(&pool);
 	if (img)
 		cuda_cs_image__free_unpacked(img, NULL);

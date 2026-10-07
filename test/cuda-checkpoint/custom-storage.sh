@@ -96,6 +96,8 @@ make -C "$MOCK_DIR"
 # Two devices (the mock's default), each with two full 64 MiB transfer chunks and a partial, unaligned
 # one: three workers move them in parallel.
 head -c $((4 * 64 * 1024 * 1024 + 4093)) /dev/urandom >"$WORK_DIR/gpu-in"
+# The second chunk of the first device is all zeros: it is not written and the restore clears it on the device.
+dd if=/dev/zero of="$WORK_DIR/gpu-in" bs=1M seek=64 count=64 conv=notrunc status=none
 
 # auto: the API is there, so the GPU memory goes through gpu-cs-<pid>.img and comes back intact.
 # Each worker's two pinned buffers serve every device: 3 workers, 6 allocations.
@@ -109,10 +111,16 @@ CS_IMAGE="$WORK_DIR/auto/gpu-cs-$TARGET_PID.img"
 [ -s "$CS_IMAGE" ] || fail "auto: no $CS_IMAGE"
 [ "$(grep -c "custom-storage checkpoint copy: .*, 3 threads," "$WORK_DIR/auto/dump.log")" -eq 2 ] ||
 	fail "auto: dump did not use 3 workers on each of the 2 devices"
+grep -q "checkpoint copy: .*zero chunks 1/3$" "$WORK_DIR/auto/dump.log" || fail "auto: zero chunk not skipped"
+grep -q "checkpoint copy: .*zero chunks 0/3$" "$WORK_DIR/auto/dump.log" || fail "auto: zero chunk miscounted"
+# The image spans both regions but has a hole where the zero chunk is.
+[ "$(stat -c %s "$CS_IMAGE")" -eq $((4096 + 2 * (2 * 64 * 1024 * 1024 + 4096))) ] || fail "auto: image length"
+[ "$(stat -c %b "$CS_IMAGE")" -lt $((4 * 64 * 1024 * 1024 / 512)) ] || fail "auto: no hole for the zero chunk"
 criu restore "$WORK_DIR/auto" "$MOCK_DIR/custom-storage" --restore-detached || fail "auto: restore failed"
 cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "auto: restored GPU memory differs"
 [ "$(grep -c "custom-storage restore copy: .*, 3 threads," "$WORK_DIR/auto/restore.log")" -eq 2 ] ||
 	fail "auto: restore did not use 3 workers on each of the 2 devices"
+grep -q "restore copy: .*zero chunks 1/3$" "$WORK_DIR/auto/restore.log" || fail "auto: zero chunk not cleared on the device"
 [ "$(sort -u "$CRIU_CUDA_MOCK_CTX_MARKER" | tr '\n' ' ')" = "0 1 " ] || fail "auto: contexts on other GPUs at restore"
 rm "$CRIU_CUDA_MOCK_CTX_MARKER"
 unset CRIU_CUDA_MOCK_CS_MAX_HOST_ALLOCS CRIU_CUDA_MOCK_CTX_MARKER
@@ -137,13 +145,18 @@ if cmp -s "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out"; then
 fi
 
 # One worker per device also dumps all three chunks, copying each one while it writes the previous one.
+# CUDA_CS_ZERO_SKIP=0 writes the zero chunk too.
 CS_THREADS=1
+export CUDA_CS_ZERO_SKIP=0
 dump "$WORK_DIR/one" "$MOCK_DIR/custom-storage" auto || fail "1 worker: dump failed"
+unset CUDA_CS_ZERO_SKIP
 CS_THREADS=
-grep -q "custom-storage checkpoint copy: .*, 1 threads," "$WORK_DIR/one/dump.log" || fail "1 worker: dump not 1 thread"
+grep -q "custom-storage checkpoint copy: .*, 1 threads,.*zero chunks 0/3 (skip off)" "$WORK_DIR/one/dump.log" ||
+	fail "1 worker: dump not 1 thread, or the zero chunk was skipped"
 ONE_PID=$TARGET_PID
 ONE_IMAGE="$WORK_DIR/one/gpu-cs-$TARGET_PID.img"
 [ "$(head -c 4 "$ONE_IMAGE")" = CUCS ] || fail "image: no CUCS magic"
+[ "$(stat -c %b "$ONE_IMAGE")" -ge $((4 * 64 * 1024 * 1024 / 512)) ] || fail "image: skip off left a hole"
 # The first device ends inside its last 4 KiB block, after a full chunk went through the same buffer:
 # the rest of that block is zeroed, not left over from the earlier chunk.
 DEV0_END=$((4096 + $(stat -c %s "$WORK_DIR/gpu-in") / 2))
