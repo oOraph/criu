@@ -11,6 +11,7 @@ CRIU="$ROOT/criu/criu"
 MOCK_DIR="$ROOT/test/cuda-checkpoint"
 WORK_DIR=$(mktemp -d)
 TARGET_PID=
+FULL_DIR=
 
 cleanup()
 {
@@ -19,6 +20,7 @@ cleanup()
 		kill "$TARGET_PID" 2>/dev/null || true
 		wait "$TARGET_PID" 2>/dev/null || true
 	fi
+	[ -z "$FULL_DIR" ] || umount "$FULL_DIR" || true
 	# Keep CRIU logs from a failed run for inspection.
 	if [ "$status" -eq 0 ]; then
 		rm -rf "$WORK_DIR"
@@ -157,6 +159,40 @@ if criu restore "$CS_IMAGES" "$MOCK_DIR/custom-storage" --restore-detached \
 fi
 grep -q "checkpointed to custom storage, which the cuda-checkpoint CLI backend cannot restore" \
 	"$CS_IMAGES/restore.log" || fail "cuda-checkpoint: missing error"
+
+# A full disk fails the dump after the driver mapped the GPU memory, which it cannot unmap without
+# dropping it: the rollback restores the copy kept in CRIU's memory and the task keeps running.
+FULL_DIR="$WORK_DIR/full"
+mkdir "$FULL_DIR"
+mount -t tmpfs -o size=32m tmpfs "$FULL_DIR"
+rm -f "$WORK_DIR/gpu-out"
+sleep 300 &
+TARGET_PID=$!
+if criu dump "$FULL_DIR" "$MOCK_DIR/custom-storage" --tree "$TARGET_PID" --timeout 10; then
+	fail "full: dump succeeded"
+fi
+grep -q "Kept .* bytes of GPU memory in host memory for the rollback" "$FULL_DIR/dump.log" ||
+	fail "full: the GPU memory was not kept"
+kill -0 "$TARGET_PID" || fail "full: the task did not survive the failed dump"
+cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "full: the rollback did not restore the GPU memory"
+if ls "$FULL_DIR"/gpu-cs-*.img >/dev/null 2>&1; then
+	fail "full: a partial gpu-cs image was kept"
+fi
+kill "$TARGET_PID"
+wait "$TARGET_PID" 2>/dev/null || true
+TARGET_PID=
+umount "$FULL_DIR"
+FULL_DIR=
+
+# A truncated image fails the restore, and the task does not run with incomplete GPU memory.
+mkdir "$WORK_DIR/truncated"
+cp -a "$CS_IMAGES"/. "$WORK_DIR/truncated/"
+truncate -s 100M "$WORK_DIR/truncated/$(basename "$CS_IMAGE")"
+if criu restore "$WORK_DIR/truncated" "$MOCK_DIR/custom-storage" --restore-detached; then
+	fail "truncated: restore succeeded"
+fi
+grep -q "GPU memory of pid .* was not restored" "$WORK_DIR/truncated/restore.log" ||
+	fail "truncated: missing error"
 
 # on: a driver without the API must fail the dump.
 if dump "$WORK_DIR/on" "$MOCK_DIR" on; then

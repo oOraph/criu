@@ -81,6 +81,10 @@ struct pid_info {
 	bool failed;
 	/* Its GPU memory was checkpointed to custom storage, not to its host memory. */
 	bool cs_used;
+	/* The image could not be written: a copy of its GPU memory for the rollback, */
+	struct cuda_cs_rescue *cs_rescue;
+	/* or none could be kept and its GPU memory is gone. */
+	bool cs_lost;
 	struct list_head list;
 };
 
@@ -96,6 +100,7 @@ static void free_cuda_pid_list(void)
 
 	list_for_each_entry_safe(info, n, &cuda_pids, list) {
 		list_del(&info->list);
+		cuda_cs_rescue_free(info->cs_rescue);
 		xfree(info);
 	}
 }
@@ -113,6 +118,8 @@ static int track_cuda_pid(int pid, cuda_task_state_t initial_state, cuda_task_st
 	info->lock_pending = false;
 	info->failed = false;
 	info->cs_used = false;
+	info->cs_rescue = NULL;
+	info->cs_lost = false;
 	list_add_tail(&info->list, &cuda_pids);
 
 	return 0;
@@ -652,8 +659,14 @@ static int checkpoint_device(void *arg)
 			pr_err("Driver returned no custom storage info for pid %d\n", pid);
 			ret = -1;
 		} else {
-			if (cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), false))
+			if (cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), false)) {
 				ret = -1;
+				/* Free the disk first: it may be full. */
+				cuda_cs_image_remove(pid, criu_get_image_dir());
+				/* Completing drops the mapping, the only copy of the GPU memory left. */
+				task_info->cs_rescue = cuda_cs_rescue_save(cs_info);
+				task_info->cs_lost = !task_info->cs_rescue;
+			}
 			if (cuda_cs_complete(cs_info->handle))
 				ret = -1;
 		}
@@ -854,8 +867,12 @@ struct cuda_resume_operation {
 	cuda_task_state_t current;
 	cuda_task_state_t initial;
 	const struct cuda_device_map *map;
-	/* The GPU memory comes back from custom storage. */
+	/* The GPU memory comes back from custom storage, */
 	bool custom_storage;
+	/* from this copy in CRIU's memory instead of the image if set. */
+	struct cuda_cs_rescue *cs_rescue;
+	/* Set when the task cannot get its GPU memory back and must not run. */
+	bool kill;
 };
 
 static int restore_device(void *arg)
@@ -929,10 +946,21 @@ static int restore_device(void *arg)
 						pr_err("Driver returned no custom storage info for pid %d\n", pid);
 						ret = -1;
 					} else {
-						if (cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), true))
-							ret = -1;
+						int err;
+
+						if (op->cs_rescue)
+							err = cuda_cs_rescue_restore(op->cs_rescue, cs_info);
+						else
+							err = cuda_cs_transfer(pid, cs_info, criu_get_image_dir(), true);
 						if (cuda_cs_complete(cs_info->handle))
+							err = -1;
+						if (err) {
+							/* Do not unlock a task whose GPU memory is incomplete. */
+							pr_err("GPU memory of pid %d was not restored\n", pid);
+							op->kill = true;
 							ret = -1;
+							goto out;
+						}
 					}
 				}
 				current_task_state = CUDA_TASK_LOCKED;
@@ -995,6 +1023,7 @@ static int resume_device(int pid, cuda_task_state_t current_task_state,
 	};
 	enum cuda_restore_tid_result tid_result;
 	int restore_tid;
+	int ret;
 
 	if (!cuda_pid_usable(pid))
 		return -1;
@@ -1040,6 +1069,14 @@ static int resume_device(int pid, cuda_task_state_t current_task_state,
 		struct pid_info *info = find_cuda_pid(pid);
 
 		op.custom_storage = info && info->cs_used;
+		op.cs_rescue = info ? info->cs_rescue : NULL;
+		if (info && info->cs_lost) {
+			pr_err("GPU memory of pid %d was lost with its custom-storage image; killing it\n", pid);
+			mark_cuda_pid_failed(pid);
+			if (kill(pid, SIGKILL) < 0 && errno != ESRCH)
+				pr_perror("Unable to kill target pid %d", pid);
+			return -1;
+		}
 	} else {
 		int exists = cuda_cs_image_exists(pid, criu_get_image_dir());
 
@@ -1059,7 +1096,13 @@ static int resume_device(int pid, cuda_task_state_t current_task_state,
 	/* wakeup the restore thread so we can handle the restore for this pid,
 	 * rseq_cs has to be restored before execution
 	 */
-	return run_cuda_operation(pid, restore_tid, restore_device, &op);
+	ret = run_cuda_operation(pid, restore_tid, restore_device, &op);
+	if (op.kill) {
+		mark_cuda_pid_failed(pid);
+		if (kill(pid, SIGKILL) < 0 && errno != ESRCH)
+			pr_perror("Unable to kill target pid %d", pid);
+	}
+	return ret;
 }
 
 static int cuda_driver_resume_devices_late(int pid, const struct cuda_device_map *map)

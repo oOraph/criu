@@ -48,6 +48,16 @@ int cuda_cs_image_remove(int pid, int img_dir_fd);
 int cuda_cs_prepare(void);
 /* Copy the mapped regions to (restore=false) or from (restore=true) gpu-cs-<nspid>.img in img_dir_fd. */
 int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_fd, bool restore);
+/*
+ * The driver has no way to cancel a custom-storage checkpoint: once it is
+ * completed, the GPU memory exists only where CRIU copied it. If the image
+ * cannot be written, keep a copy in CRIU's memory so that the dump rollback
+ * can still restore the task.
+ */
+struct cuda_cs_rescue;
+struct cuda_cs_rescue *cuda_cs_rescue_save(CUcheckpointCustomStorageInfo *info);
+int cuda_cs_rescue_restore(struct cuda_cs_rescue *r, CUcheckpointCustomStorageInfo *info);
+void cuda_cs_rescue_free(struct cuda_cs_rescue *r);
 /* Tell the driver the copies are done (synchronises its streams, unmaps). */
 int cuda_cs_complete(CUcheckpointOperationHandle handle);
 

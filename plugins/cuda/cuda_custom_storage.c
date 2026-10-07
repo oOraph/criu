@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -279,6 +280,7 @@ static int cs_threads(void)
 
 struct cs_xfer {
 	int fd;
+	char *mem; /* host memory to copy to or from instead of fd */
 	off_t file_off;
 	CUdeviceptr dptr;
 	size_t size;
@@ -343,12 +345,16 @@ static void *cs_worker(void *p)
 			}
 			cs.event_record(ev[b], st);
 			cs.event_synchronize(ev[b]);
-			if (pwrite(x->fd, buf[b], iolen, x->file_off + off) != (ssize_t)iolen) {
+			if (x->mem) {
+				memcpy(x->mem + x->file_off + off, buf[b], len);
+			} else if (pwrite(x->fd, buf[b], iolen, x->file_off + off) != (ssize_t)iolen) {
 				pr_perror("[w%d] pwrite", w->id);
 				goto fail;
 			}
 		} else {
-			if (pread(x->fd, buf[b], iolen, x->file_off + off) < (ssize_t)len) {
+			if (x->mem) {
+				memcpy(buf[b], x->mem + x->file_off + off, len);
+			} else if (pread(x->fd, buf[b], iolen, x->file_off + off) < (ssize_t)len) {
 				pr_perror("[w%d] pread", w->id);
 				goto fail;
 			}
@@ -375,7 +381,8 @@ out:
 	return NULL;
 }
 
-static int cs_xfer_region(int fd, off_t file_off, CUcheckpointCustomStoragePerDeviceData *d, bool restore, bool direct)
+static int cs_xfer_region(int fd, char *mem, off_t file_off, CUcheckpointCustomStoragePerDeviceData *d, bool restore,
+			  bool direct)
 {
 	struct cs_xfer x;
 	struct cs_warg wa[CS_MAXTHR];
@@ -400,6 +407,7 @@ static int cs_xfer_region(int fd, off_t file_off, CUcheckpointCustomStoragePerDe
 	}
 	memset(&x, 0, sizeof(x));
 	x.fd = fd;
+	x.mem = mem;
 	x.file_off = file_off;
 	x.dptr = d->devPtr;
 	x.size = d->size;
@@ -429,7 +437,7 @@ static int cs_xfer_region(int fd, off_t file_off, CUcheckpointCustomStoragePerDe
 	cs.stream_synchronize(d->stream);
 	pr_info("[timing] custom-storage %s: %.2f GB, %d threads, %.0f ms (%.1f GB/s, %s)\n",
 		restore ? "restore copy" : "checkpoint copy", d->size / 1e9, n, cs_now_ms() - t0,
-		d->size / (cs_now_ms() - t0) / 1e6, direct ? "O_DIRECT" : "buffered");
+		d->size / (cs_now_ms() - t0) / 1e6, mem ? "host memory" : direct ? "O_DIRECT" : "buffered");
 	return atomic_load(&x.err) ? -1 : 0;
 }
 
@@ -503,7 +511,7 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 			       (unsigned long long)h.size[i], d->size);
 			goto out;
 		}
-		if (cs_xfer_region(fd, off, d, restore, direct))
+		if (cs_xfer_region(fd, NULL, off, d, restore, direct))
 			goto out;
 		off += (d->size + 4095) & ~4095UL;
 	}
@@ -514,4 +522,74 @@ out:
 	free(hb);
 	close(fd);
 	return ret;
+}
+
+struct cuda_cs_rescue {
+	char *mem;
+	size_t len;
+	unsigned int ndev;
+	size_t size[CS_MAXDEV];
+};
+
+struct cuda_cs_rescue *cuda_cs_rescue_save(CUcheckpointCustomStorageInfo *info)
+{
+	struct cuda_cs_rescue *r;
+	size_t off = 0;
+	unsigned int i;
+
+	if (!info || info->deviceCount > CS_MAXDEV)
+		return NULL;
+	r = calloc(1, sizeof(*r));
+	if (!r)
+		return NULL;
+	r->ndev = info->deviceCount;
+	for (i = 0; i < r->ndev; i++) {
+		r->size[i] = info->perDeviceData[i].size;
+		r->len += r->size[i];
+	}
+	r->mem = mmap(NULL, r->len ?: 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (r->mem == MAP_FAILED) {
+		pr_perror("Unable to allocate %zu bytes to keep the GPU memory", r->len);
+		free(r);
+		return NULL;
+	}
+	for (i = 0; i < r->ndev; i++) {
+		if (cs_xfer_region(-1, r->mem, off, &info->perDeviceData[i], false, false)) {
+			cuda_cs_rescue_free(r);
+			return NULL;
+		}
+		off += r->size[i];
+	}
+	pr_info("Kept %zu bytes of GPU memory in host memory for the rollback\n", r->len);
+	return r;
+}
+
+int cuda_cs_rescue_restore(struct cuda_cs_rescue *r, CUcheckpointCustomStorageInfo *info)
+{
+	size_t off = 0;
+	unsigned int i;
+
+	if (!info || info->deviceCount != r->ndev) {
+		pr_err("The driver maps %u devices to restore, %u were kept\n", info ? info->deviceCount : 0, r->ndev);
+		return -1;
+	}
+	for (i = 0; i < r->ndev; i++) {
+		if (info->perDeviceData[i].size != r->size[i]) {
+			pr_err("Device %u: the driver maps %zu bytes to restore, %zu were kept\n", i,
+			       info->perDeviceData[i].size, r->size[i]);
+			return -1;
+		}
+		if (cs_xfer_region(-1, r->mem, off, &info->perDeviceData[i], true, false))
+			return -1;
+		off += r->size[i];
+	}
+	return 0;
+}
+
+void cuda_cs_rescue_free(struct cuda_cs_rescue *r)
+{
+	if (!r)
+		return;
+	munmap(r->mem, r->len ?: 1);
+	free(r);
 }
