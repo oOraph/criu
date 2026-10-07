@@ -164,12 +164,24 @@ TARGET_PID=$ONE_PID
 stop_target
 TARGET_PID=
 cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "remap: GPU memory restored on the wrong GPUs"
-# Without a device map, other GPUs have no checkpointed memory.
+# Without a device map, two GPUs that both changed cannot be told apart.
 if CRIU_CUDA_MOCK_UUID_OFFSET=64 criu restore "$WORK_DIR/one" "$MOCK_DIR/custom-storage" --restore-detached; then
 	fail "other GPUs: restore succeeded"
 fi
-grep -q "has no checkpointed memory; restoring on other GPUs needs cuda_plugin.device-map" \
+grep -q "2 GPUs changed since the checkpoint: restoring them needs cuda_plugin.device-map" \
 	"$WORK_DIR/one/restore.log" || fail "other GPUs: missing error"
+
+# A task on one GPU restores onto another one without a device map, as a container given another GPU does.
+export CRIU_CUDA_MOCK_CS_DEVICES=1
+dump "$WORK_DIR/single" "$MOCK_DIR/custom-storage" auto || fail "single GPU: dump failed"
+rm -f "$WORK_DIR/gpu-out"
+CRIU_CUDA_MOCK_UUID_OFFSET=64 criu restore "$WORK_DIR/single" "$MOCK_DIR/custom-storage" --restore-detached ||
+	fail "single GPU: restore on another GPU failed"
+stop_target
+TARGET_PID=
+unset CRIU_CUDA_MOCK_CS_DEVICES
+cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "single GPU: restored GPU memory differs"
+grep -q "takes the memory checkpointed on GPU" "$WORK_DIR/single/restore.log" || fail "single GPU: not reported"
 
 # off: the API is there but must not be used.
 dump "$WORK_DIR/off" "$MOCK_DIR/custom-storage" off || fail "off: dump failed"

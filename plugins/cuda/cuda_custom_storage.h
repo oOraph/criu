@@ -51,7 +51,8 @@ void cuda_cs_fini(void);
 /*
  * Copy the mapped regions to (restore=false) or from (restore=true) gpu-cs-<nspid>.img in img_dir_fd.
  * On restore, each region gets the memory of the GPU that pairs (the device map, old to new UUID) maps
- * to its GPU, or of its own GPU without a pair.
+ * to its GPU, or of its own GPU without a pair; without a map, a single GPU that changed takes the
+ * memory of the single checkpointed GPU left.
  */
 int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_fd, bool restore,
 		     const CUcheckpointGpuPair *pairs, unsigned int npairs);

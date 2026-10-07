@@ -528,38 +528,63 @@ static const char *cs_uuid_str(const unsigned char uuid[16], char buf[33])
 
 /*
  * The driver gives no order for the regions it maps, and a restore can move
- * the task to other GPUs (pairs: the device map). Find the checkpointed region
- * whose memory goes to the GPU new_uuid; used[] rejects mapping one twice.
+ * the task to other GPUs. Give each mapped region, on GPU cur[j], the
+ * checkpointed region of the GPU it comes from: the one the device map (pairs,
+ * old to new UUID) gives, or the same GPU. Without a map, the driver also
+ * restores a task onto another GPU on its own, e.g. a container given another
+ * GPU: a single region left on each side can only go together. Fail on
+ * anything else rather than give a GPU the memory of another one.
  */
-static int cs_find_source(const unsigned char new_uuid[16], const unsigned char (*old)[16], unsigned int n,
-			  bool *used, const CUcheckpointGpuPair *pairs, unsigned int npairs)
+static int cs_assign(const unsigned char (*cur)[16], const unsigned char (*old)[16], unsigned int n,
+		     const CUcheckpointGpuPair *pairs, unsigned int npairs, int *src)
 {
-	const unsigned char *want = new_uuid;
+	bool used[CS_MAXDEV] = {};
+	int left_cur = -1, left_old = -1;
+	unsigned int i, j, nleft = 0;
 	char a[33], b[33];
-	unsigned int i;
 
-	for (i = 0; i < npairs; i++) {
-		if (!memcmp(pairs[i].newUuid, new_uuid, 16)) {
-			want = pairs[i].oldUuid;
+	for (j = 0; j < n; j++) {
+		const unsigned char *want = cur[j];
+
+		for (i = 0; i < npairs; i++) {
+			if (!memcmp(pairs[i].newUuid, cur[j], 16)) {
+				want = pairs[i].oldUuid;
+				break;
+			}
+		}
+		src[j] = -1;
+		for (i = 0; i < n; i++) {
+			if (memcmp(old[i], want, 16))
+				continue;
+			if (used[i]) {
+				pr_err("GPU %s was checkpointed once but is restored twice\n", cs_uuid_str(want, a));
+				return -1;
+			}
+			used[i] = true;
+			src[j] = i;
 			break;
 		}
-	}
-	for (i = 0; i < n; i++) {
-		if (memcmp(old[i], want, 16))
-			continue;
-		if (used[i]) {
-			pr_err("GPU %s was checkpointed once but is restored twice\n", cs_uuid_str(want, a));
-			return -1;
+		if (src[j] < 0) {
+			left_cur = j;
+			nleft++;
 		}
-		used[i] = true;
-		return i;
 	}
-	if (want == new_uuid)
-		pr_err("GPU %s has no checkpointed memory; restoring on other GPUs needs cuda_plugin.device-map\n",
-		       cs_uuid_str(new_uuid, a));
-	else
-		pr_err("GPU %s is restored from GPU %s, which has no checkpointed memory\n", cs_uuid_str(new_uuid, a),
-		       cs_uuid_str(want, b));
+	if (!nleft)
+		return 0;
+	for (i = 0; i < n; i++)
+		if (!used[i])
+			left_old = i;
+	if (nleft == 1 && !npairs) {
+		pr_info("GPU %s takes the memory checkpointed on GPU %s\n", cs_uuid_str(cur[left_cur], a),
+			cs_uuid_str(old[left_old], b));
+		src[left_cur] = left_old;
+		return 0;
+	}
+	for (j = 0; j < n; j++)
+		if (src[j] < 0)
+			pr_err("No checkpointed GPU memory for GPU %s\n", cs_uuid_str(cur[j], a));
+	if (!npairs)
+		pr_err("%u GPUs changed since the checkpoint: restoring them needs cuda_plugin.device-map\n", nleft);
 	return -1;
 }
 
@@ -726,7 +751,7 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 	bool direct = true;
 	CudaCsRegion regions[CS_MAXDEV];
 	unsigned char uuids[CS_MAXDEV][16], old[CS_MAXDEV][16];
-	bool used[CS_MAXDEV] = {};
+	int src[CS_MAXDEV];
 	struct cs_pool pool = {};
 	CudaCsImage *img = NULL;
 	void *hb = NULL;
@@ -774,17 +799,13 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 			memcpy(old[i], img->regions[i]->uuid.data, 16);
 	}
 
+	if (restore && cs_assign(uuids, old, info->deviceCount, pairs, npairs, src))
+		goto out;
+
 	for (i = 0; i < info->deviceCount; i++) {
 		CUcheckpointCustomStoragePerDeviceData *d = &info->perDeviceData[i];
-		CudaCsRegion *r = &regions[i];
+		CudaCsRegion *r = restore ? img->regions[src[i]] : &regions[i];
 
-		if (restore) {
-			int src = cs_find_source(uuids[i], old, img->n_regions, used, pairs, npairs);
-
-			if (src < 0)
-				goto out;
-			r = img->regions[src];
-		}
 		if (d->size != r->size) {
 			pr_err("%s: device %u size mismatch (image %llu, driver %zu)\n", fname, i,
 			       (unsigned long long)r->size, d->size);
@@ -858,9 +879,10 @@ struct cuda_cs_rescue *cuda_cs_rescue_save(CUcheckpointCustomStorageInfo *info)
 
 int cuda_cs_rescue_restore(struct cuda_cs_rescue *r, CUcheckpointCustomStorageInfo *info)
 {
-	bool used[CS_MAXDEV] = {};
+	unsigned char uuids[CS_MAXDEV][16];
 	struct cs_pool pool = {};
 	size_t off[CS_MAXDEV];
+	int src[CS_MAXDEV];
 	unsigned int i;
 	int ret = -1;
 
@@ -868,24 +890,22 @@ int cuda_cs_rescue_restore(struct cuda_cs_rescue *r, CUcheckpointCustomStorageIn
 		pr_err("The driver maps %u devices to restore, %u were kept\n", info ? info->deviceCount : 0, r->ndev);
 		return -1;
 	}
-	for (i = 0; i < r->ndev; i++)
+	for (i = 0; i < r->ndev; i++) {
 		off[i] = i ? off[i - 1] + r->size[i - 1] : 0;
+		if (cs_region_uuid(&info->perDeviceData[i], uuids[i]))
+			return -1;
+	}
+	if (cs_assign(uuids, r->uuid, r->ndev, NULL, 0, src))
+		return -1;
 	for (i = 0; i < r->ndev; i++) {
 		CUcheckpointCustomStoragePerDeviceData *d = &info->perDeviceData[i];
-		unsigned char uuid[16];
-		int src;
 
-		if (cs_region_uuid(d, uuid))
-			goto out;
-		src = cs_find_source(uuid, r->uuid, r->ndev, used, NULL, 0);
-		if (src < 0)
-			goto out;
-		if (d->size != r->size[src]) {
+		if (d->size != r->size[src[i]]) {
 			pr_err("Device %u: the driver maps %zu bytes to restore, %zu were kept\n", i, d->size,
-			       r->size[src]);
+			       r->size[src[i]]);
 			goto out;
 		}
-		if (cs_xfer_region(-1, r->mem, off[src], d, true, false, &pool))
+		if (cs_xfer_region(-1, r->mem, off[src[i]], d, true, false, &pool))
 			goto out;
 	}
 	ret = 0;

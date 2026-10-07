@@ -170,6 +170,9 @@ custom-storage API; without one, it restores the GPU memory the regular way.
 The image records the UUID of the GPU each device's memory was on, and
 restore puts it on the GPU that `cuda_plugin.device-map` gives for that one,
 or on the same GPU without a map, whatever order the driver lists them in.
+Without a map, a task that used one GPU can also restore onto another one, as
+the driver allows: the only GPU left takes the only memory left. With more
+GPUs changed, restore needs the map.
 
 ## GPU device mapping
 
