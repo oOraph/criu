@@ -30,6 +30,9 @@ typedef enum {
 	CU_PROCESS_STATE_LOCKED,
 	CU_PROCESS_STATE_CHECKPOINTED,
 	CU_PROCESS_STATE_FAILED,
+	/* CUDA 13.4: a custom-storage operation is mapped and not completed yet. */
+	CU_PROCESS_STATE_CHECKPOINTING,
+	CU_PROCESS_STATE_RESTORING,
 } CUprocessState;
 
 typedef struct {

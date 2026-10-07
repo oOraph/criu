@@ -369,6 +369,12 @@ static cuda_task_state_t get_cuda_state(pid_t pid)
 		return CUDA_TASK_CHECKPOINTED;
 	case CU_PROCESS_STATE_FAILED:
 		return CUDA_TASK_FAILED;
+	case CU_PROCESS_STATE_CHECKPOINTING:
+	case CU_PROCESS_STATE_RESTORING:
+		/* A custom-storage operation that was not completed: the task cannot resume. */
+		pr_err("pid %d is still %s to custom storage\n", pid,
+		       state == CU_PROCESS_STATE_CHECKPOINTING ? "checkpointing" : "restoring");
+		return CUDA_TASK_FAILED;
 	default:
 		pr_err("Unknown CUDA process state for pid %d: %d\n", pid, state);
 		return CUDA_TASK_UNKNOWN;
