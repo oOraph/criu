@@ -1,7 +1,8 @@
 #!/bin/sh
 # Custom-storage mode (cuda_plugin.custom-storage=auto|on|off) against the mock Driver API: the mock's
 # device memory is filled from a file on checkpoint and written to another file after restore; both
-# must match. "off" keeps the regular path and "on" fails without the API.
+# must match. "off" keeps the regular path and "on" fails without the API. Restore follows the image,
+# whatever the restoring driver supports.
 
 set -eu
 
@@ -58,17 +59,19 @@ criu()
 		CRIU_CUDA_MOCK_CS_INPUT="$WORK_DIR/gpu-in" \
 		CRIU_CUDA_MOCK_CS_OUTPUT="$WORK_DIR/gpu-out" \
 		CUDA_CS_THREADS="${CS_THREADS:-4}" \
+		PATH="$MOCK_DIR:$PATH" \
 		LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 		"$CRIU" "$ACTION" --no-default-config --images-dir "$IMAGES" --log-file "$ACTION.log" \
 		--verbosity=4 --libdir "$ROOT/plugins/cuda" --shell-job "$@"
 }
 
-# dump <images> <mock library dir> <custom-storage mode>
+# dump <images> <mock library dir> <custom-storage mode>; STALE=1 plants a gpu-cs image from an earlier dump
 dump()
 {
 	mkdir "$1"
 	sleep 300 &
 	TARGET_PID=$!
+	[ -z "${STALE:-}" ] || cp "$CS_IMAGE" "$1/gpu-cs-$TARGET_PID.img"
 	STATUS=0
 	criu dump "$1" "$2" --tree "$TARGET_PID" --timeout 10 --plugin-option "cuda_plugin.custom-storage=$3" ||
 		STATUS=$?
@@ -116,10 +119,44 @@ fi
 
 # off: the API is there but must not be used.
 dump "$WORK_DIR/off" "$MOCK_DIR/custom-storage" off || fail "off: dump failed"
-TARGET_PID=
 if ls "$WORK_DIR"/off/gpu-cs-*.img >/dev/null 2>&1; then
 	fail "off: a custom-storage image was written"
 fi
+
+# An image dumped without custom storage restores the regular way on a driver that has the API.
+rm -f "$WORK_DIR/gpu-out"
+criu restore "$WORK_DIR/off" "$MOCK_DIR/custom-storage" --restore-detached || fail "off: restore failed"
+stop_target
+TARGET_PID=
+! grep -q "custom-storage restore copy" "$WORK_DIR/off/restore.log" || fail "off: restore used custom storage"
+[ ! -e "$WORK_DIR/gpu-out" ] || fail "off: restore went through custom storage"
+
+# A dump without custom storage removes the gpu-cs image an earlier dump left for the same pid.
+STALE=1 dump "$WORK_DIR/stale" "$MOCK_DIR/custom-storage" off || fail "stale: dump failed"
+TARGET_PID=
+if ls "$WORK_DIR"/stale/gpu-cs-*.img >/dev/null 2>&1; then
+	fail "stale: the earlier gpu-cs image was kept"
+fi
+
+# An image dumped with custom storage cannot be restored without it.
+CS_IMAGES="$WORK_DIR/auto"
+if criu restore "$CS_IMAGES" "$MOCK_DIR" --restore-detached; then
+	fail "no API: restore of a custom-storage image succeeded"
+fi
+grep -q "checkpointed to custom storage, but libcuda has no custom-storage checkpoint API" \
+	"$CS_IMAGES/restore.log" || fail "no API: missing error"
+if criu restore "$CS_IMAGES" "$MOCK_DIR/custom-storage" --restore-detached \
+	--plugin-option cuda_plugin.custom-storage=off; then
+	fail "off: restore of a custom-storage image succeeded"
+fi
+grep -q "cannot be restored with cuda_plugin.custom-storage=off" "$CS_IMAGES/restore.log" ||
+	fail "off: missing error"
+if criu restore "$CS_IMAGES" "$MOCK_DIR/custom-storage" --restore-detached \
+	--plugin-option cuda_plugin.backend=cuda-checkpoint; then
+	fail "cuda-checkpoint: restore of a custom-storage image succeeded"
+fi
+grep -q "checkpointed to custom storage, which the cuda-checkpoint CLI backend cannot restore" \
+	"$CS_IMAGES/restore.log" || fail "cuda-checkpoint: missing error"
 
 # on: a driver without the API must fail the dump.
 if dump "$WORK_DIR/on" "$MOCK_DIR" on; then

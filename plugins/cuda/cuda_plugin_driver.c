@@ -79,6 +79,8 @@ struct pid_info {
 	bool lock_pending;
 	/* The task was killed or its CUDA state is unknown after a failure. */
 	bool failed;
+	/* Its GPU memory was checkpointed to custom storage, not to its host memory. */
+	bool cs_used;
 	struct list_head list;
 };
 
@@ -110,6 +112,7 @@ static int track_cuda_pid(int pid, cuda_task_state_t initial_state, cuda_task_st
 	info->initial_task_state = initial_state;
 	info->lock_pending = false;
 	info->failed = false;
+	info->cs_used = false;
 	list_add_tail(&info->list, &cuda_pids);
 
 	return 0;
@@ -644,6 +647,7 @@ static int checkpoint_device(void *arg)
 		ret = -1;
 	} else if (cuda_cs_active()) {
 		/* the target is CHECKPOINTING: its VRAM is mapped into CRIU until we complete the operation */
+		task_info->cs_used = true;
 		if (!cs_info) {
 			pr_err("Driver returned no custom storage info for pid %d\n", pid);
 			ret = -1;
@@ -850,6 +854,8 @@ struct cuda_resume_operation {
 	cuda_task_state_t current;
 	cuda_task_state_t initial;
 	const struct cuda_device_map *map;
+	/* The GPU memory comes back from custom storage. */
+	bool custom_storage;
 };
 
 static int restore_device(void *arg)
@@ -899,10 +905,10 @@ static int restore_device(void *arg)
 			args.gpuPairs = op->map->pairs;
 			args.gpuPairsCount = op->map->count;
 		}
-		if (cuda_cs_active())
+		if (op->custom_storage)
 			args.customStorageInfo_out = &cs_info;
 
-		if (cuda_driver_init() || (cuda_cs_active() && cuda_cs_prepare())) {
+		if (cuda_driver_init() || (op->custom_storage && cuda_cs_prepare())) {
 			if (atomic_load(&operation_aborted))
 				return -1;
 			ret = -1;
@@ -917,7 +923,7 @@ static int restore_device(void *arg)
 				 */
 				ret = -1;
 			} else {
-				if (cuda_cs_active()) {
+				if (op->custom_storage) {
 					/* the target is RESTORING: fill its VRAM from gpu-cs-<nspid>.img, then complete */
 					if (!cs_info) {
 						pr_err("Driver returned no custom storage info for pid %d\n", pid);
@@ -1025,6 +1031,23 @@ static int resume_device(int pid, cuda_task_state_t current_task_state,
 	if (tid_result == CUDA_RESTORE_TID_ERROR) {
 		pr_err("Unable to find CUDA restore thread for pid %d\n", pid);
 		return -1;
+	}
+
+	/* Follow what the checkpoint did, not what this driver supports: a dump
+	 * rolls back the way it checkpointed, a restore follows the image.
+	 */
+	if (dump_rollback) {
+		struct pid_info *info = find_cuda_pid(pid);
+
+		op.custom_storage = info && info->cs_used;
+	} else {
+		int exists = cuda_cs_image_exists(pid, criu_get_image_dir());
+
+		if (exists < 0)
+			return -1;
+		op.custom_storage = exists;
+		if (op.custom_storage && cuda_cs_check_restore(pid))
+			return -1;
 	}
 
 	pr_info("resuming devices on pid %d\n", pid);

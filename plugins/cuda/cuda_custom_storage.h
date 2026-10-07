@@ -36,8 +36,14 @@ extern enum cuda_cs_mode cuda_cs_mode;
 
 /* Resolve the extra driver symbols from an already dlopen()ed libcuda; -ENOTSUP if the API is absent. */
 int cuda_cs_init(void *libcuda_handle);
-/* True when the API is available and the mode allows it. */
+/* True when the API is available and the mode allows it: the dump uses custom storage. */
 bool cuda_cs_active(void);
+/* Fail unless a task checkpointed to custom storage can be restored from it. */
+int cuda_cs_check_restore(int pid);
+/* 1 if gpu-cs-<nspid>.img exists in img_dir_fd, 0 if not, -1 on error. */
+int cuda_cs_image_exists(int pid, int img_dir_fd);
+/* Remove a gpu-cs-<nspid>.img left by an earlier dump. */
+int cuda_cs_image_remove(int pid, int img_dir_fd);
 /* Retain the primary context of every device (required by the mode); call after cuInit(). */
 int cuda_cs_prepare(void);
 /* Copy the mapped regions to (restore=false) or from (restore=true) gpu-cs-<nspid>.img in img_dir_fd. */

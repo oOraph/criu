@@ -2,6 +2,8 @@
 #include "cuda_device_map.h"
 #include "cuda_plugin.h"
 #include "cuda_custom_storage.h"
+#include "cr_options.h"
+#include "criu-plugin.h"
 #include "image.h"
 #include "plugin.h"
 #include "fault-injection.h"
@@ -312,6 +314,10 @@ static int cuda_plugin_checkpoint_devices(int pid)
 	if (!active_backend)
 		return -ENOTSUP;
 
+	/* A custom-storage image makes restore use custom storage: never leave one from an earlier dump. */
+	if (!opts.stream && cuda_cs_image_remove(pid, criu_get_image_dir()))
+		return -1;
+
 	return active_backend->checkpoint_devices(pid);
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES, cuda_plugin_checkpoint_devices);
@@ -320,6 +326,19 @@ static int cuda_plugin_resume_devices_late(int pid)
 {
 	if (!active_backend)
 		return -ENOTSUP;
+
+	/* Only the Driver API backend restores GPU memory from custom storage. */
+	if (active_backend != &cuda_driver_backend && !opts.stream) {
+		int exists = cuda_cs_image_exists(pid, criu_get_image_dir());
+
+		if (exists < 0)
+			return -1;
+		if (exists) {
+			pr_err("pid %d was checkpointed to custom storage, which the %s backend cannot restore\n",
+			       pid, active_backend->name);
+			return -1;
+		}
+	}
 
 	return active_backend->resume_devices_late(pid, &restore_device_map);
 }

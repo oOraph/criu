@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -127,9 +128,10 @@ int cuda_plugin_add_inventory(void)
 	return 0;
 }
 
+/* Restore looks up gpu-cs-<pid>.img there; the guard cases have none. */
 int criu_get_image_dir(void)
 {
-	return -1;
+	return AT_FDCWD;
 }
 
 bool alarm_timeouted(void)

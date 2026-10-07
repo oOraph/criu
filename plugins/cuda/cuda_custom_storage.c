@@ -154,6 +154,21 @@ bool cuda_cs_active(void)
 	return cs_available && cuda_cs_mode != CUDA_CS_OFF;
 }
 
+int cuda_cs_check_restore(int pid)
+{
+	if (!cs_available) {
+		pr_err("pid %d was checkpointed to custom storage, but libcuda has no custom-storage checkpoint API\n",
+		       pid);
+		return -1;
+	}
+	if (cuda_cs_mode == CUDA_CS_OFF) {
+		pr_err("pid %d was checkpointed to custom storage and cannot be restored with cuda_plugin.custom-storage=off\n",
+		       pid);
+		return -1;
+	}
+	return 0;
+}
+
 int cuda_cs_prepare(void)
 {
 	int n, i;
@@ -210,6 +225,36 @@ static int cs_ns_pid(int pid)
 	}
 	fclose(f);
 	return ns;
+}
+
+static void cs_image_name(int pid, char *buf, size_t len)
+{
+	snprintf(buf, len, "gpu-cs-%d.img", cs_ns_pid(pid));
+}
+
+int cuda_cs_image_exists(int pid, int img_dir_fd)
+{
+	char fname[64];
+
+	cs_image_name(pid, fname, sizeof(fname));
+	if (!faccessat(img_dir_fd, fname, F_OK, 0))
+		return 1;
+	if (errno == ENOENT)
+		return 0;
+	pr_perror("Unable to check for %s", fname);
+	return -1;
+}
+
+int cuda_cs_image_remove(int pid, int img_dir_fd)
+{
+	char fname[64];
+
+	cs_image_name(pid, fname, sizeof(fname));
+	if (unlinkat(img_dir_fd, fname, 0) && errno != ENOENT) {
+		pr_perror("Unable to remove stale %s", fname);
+		return -1;
+	}
+	return 0;
 }
 
 static double cs_now_ms(void)
@@ -413,7 +458,7 @@ int cuda_cs_transfer(int pid, CUcheckpointCustomStorageInfo *info, int img_dir_f
 		pr_err("No image directory for the custom-storage image of pid %d\n", pid);
 		return -1;
 	}
-	snprintf(fname, sizeof(fname), "gpu-cs-%d.img", cs_ns_pid(pid));
+	cs_image_name(pid, fname, sizeof(fname));
 	fd = openat(img_dir_fd, fname, flags | O_DIRECT, 0600);
 	if (fd < 0 && errno == EINVAL) {
 		direct = false;
