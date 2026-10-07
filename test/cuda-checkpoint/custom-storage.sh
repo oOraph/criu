@@ -119,6 +119,17 @@ if cmp -s "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out"; then
 	fail "corrupted: restored GPU memory did not come from the image"
 fi
 
+# One worker per device also dumps all three chunks, copying each one while it writes the previous one.
+CS_THREADS=1
+dump "$WORK_DIR/one" "$MOCK_DIR/custom-storage" auto || fail "1 worker: dump failed"
+CS_THREADS=
+grep -q "custom-storage checkpoint copy: .*, 1 threads," "$WORK_DIR/one/dump.log" || fail "1 worker: dump not 1 thread"
+rm "$WORK_DIR/gpu-out"
+criu restore "$WORK_DIR/one" "$MOCK_DIR/custom-storage" --restore-detached || fail "1 worker: restore failed"
+cmp "$WORK_DIR/gpu-in" "$WORK_DIR/gpu-out" || fail "1 worker: dumped GPU memory differs"
+stop_target
+TARGET_PID=
+
 # off: the API is there but must not be used.
 dump "$WORK_DIR/off" "$MOCK_DIR/custom-storage" off || fail "off: dump failed"
 if ls "$WORK_DIR"/off/gpu-cs-*.img >/dev/null 2>&1; then
@@ -134,7 +145,9 @@ TARGET_PID=
 [ ! -e "$WORK_DIR/gpu-out" ] || fail "off: restore went through custom storage"
 
 # A dump without custom storage removes the gpu-cs image an earlier dump left for the same pid.
-STALE=1 dump "$WORK_DIR/stale" "$MOCK_DIR/custom-storage" off || fail "stale: dump failed"
+STALE=1
+dump "$WORK_DIR/stale" "$MOCK_DIR/custom-storage" off || fail "stale: dump failed"
+STALE=
 TARGET_PID=
 if ls "$WORK_DIR"/stale/gpu-cs-*.img >/dev/null 2>&1; then
 	fail "stale: the earlier gpu-cs image was kept"

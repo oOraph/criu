@@ -306,6 +306,28 @@ struct cs_warg {
 		}                                                           \
 	} while (0)
 
+/* Wait for the copy of a chunk into buf, then store it. */
+static int cs_store(struct cs_warg *w, void *buf, CUevent ev, size_t off, size_t len)
+{
+	struct cs_xfer *x = w->x;
+	size_t iolen = x->direct ? ((len + 4095) & ~4095UL) : len;
+	ssize_t done;
+
+	CS_CALL(cs.event_synchronize(ev), "cuEventSynchronize");
+	if (x->mem) {
+		memcpy(x->mem + x->file_off + off, buf, len);
+	} else if ((done = pwrite(x->fd, buf, iolen, x->file_off + off)) != (ssize_t)iolen) {
+		if (done < 0)
+			pr_perror("[w%d] pwrite", w->id);
+		else
+			pr_err("[w%d] short write: %zd of %zu bytes\n", w->id, done, iolen);
+		goto fail;
+	}
+	return 0;
+fail:
+	return -1;
+}
+
 static void *cs_worker(void *p)
 {
 	struct cs_warg *w = p;
@@ -314,6 +336,8 @@ static void *cs_worker(void *p)
 	CUevent ev[2] = { NULL, NULL };
 	CUstream st = NULL;
 	int inflight[2] = { 0, 0 };
+	size_t prev_off = 0, prev_len = 0;
+	bool pending = false;
 	ssize_t done;
 	int b = 0, i;
 
@@ -337,18 +361,14 @@ static void *cs_worker(void *p)
 			inflight[b] = 0;
 		}
 		if (!x->restore) {
+			/* Copy this chunk from the GPU while the previous one, in the other buffer, is stored. */
 			CS_CALL(cs.memcpy_dtoh_async(buf[b], x->dptr + off, len, st), "cuMemcpyDtoHAsync");
 			CS_CALL(cs.event_record(ev[b], st), "cuEventRecord");
-			CS_CALL(cs.event_synchronize(ev[b]), "cuEventSynchronize");
-			if (x->mem) {
-				memcpy(x->mem + x->file_off + off, buf[b], len);
-			} else if ((done = pwrite(x->fd, buf[b], iolen, x->file_off + off)) != (ssize_t)iolen) {
-				if (done < 0)
-					pr_perror("[w%d] pwrite", w->id);
-				else
-					pr_err("[w%d] short write: %zd of %zu bytes\n", w->id, done, iolen);
+			if (pending && cs_store(w, buf[b ^ 1], ev[b ^ 1], prev_off, prev_len))
 				goto fail;
-			}
+			pending = true;
+			prev_off = off;
+			prev_len = len;
 		} else {
 			if (x->mem) {
 				memcpy(buf[b], x->mem + x->file_off + off, len);
@@ -365,6 +385,9 @@ static void *cs_worker(void *p)
 			inflight[b] = 1;
 		}
 	}
+	/* The loop toggled b after the last chunk: it is in the other buffer. */
+	if (pending && cs_store(w, buf[b ^ 1], ev[b ^ 1], prev_off, prev_len))
+		goto fail;
 	CS_CALL(cs.stream_synchronize(st), "cuStreamSynchronize");
 	goto out;
 fail:
